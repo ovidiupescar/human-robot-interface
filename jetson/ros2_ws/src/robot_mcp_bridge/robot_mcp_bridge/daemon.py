@@ -18,10 +18,14 @@ import sys
 from contextlib import asynccontextmanager
 from typing import Optional
 
+import asyncio
+import json as _json
+
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from mcp.server.fastmcp import FastMCP
 
+from robot_mcp_bridge.event_bus import get_bus
 from robot_mcp_bridge.ros_node import RosBridge
 
 log = logging.getLogger("robot_mcp_bridge")
@@ -245,6 +249,29 @@ def build_app() -> FastAPI:
     @app.get("/healthz")
     def healthz():
         return {"status": "ok"}
+
+    @app.websocket("/events")
+    async def events(ws: WebSocket) -> None:
+        """Stream perception events as JSON lines to a single subscriber.
+
+        Used by the Hermes ROS2 platform adapter (which runs inside Hermes
+        in Python 3.11 and therefore cannot import rclpy). Multiple
+        connections are supported; each gets its own queue and own pace.
+        """
+        await ws.accept()
+        bus = get_bus()
+        queue = await bus.subscribe()
+        try:
+            # Send a hello so the client knows the stream is alive.
+            await ws.send_text(_json.dumps({"type": "hello",
+                                              "schema_version": 1}))
+            while True:
+                event = await queue.get()
+                await ws.send_text(_json.dumps(event))
+        except WebSocketDisconnect:
+            pass
+        finally:
+            await bus.unsubscribe(queue)
 
     return app
 

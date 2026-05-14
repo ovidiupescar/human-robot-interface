@@ -8,6 +8,8 @@ touch rclpy directly. That single ownership keeps the DDS graph simple
 
 from __future__ import annotations
 
+import base64
+import datetime as _dt
 import json
 import threading
 import time
@@ -16,16 +18,29 @@ from typing import Any, Optional
 import rclpy
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from std_msgs.msg import Float32, String
+from std_msgs.msg import Bool, Float32, String, UInt8MultiArray
 
 from robot_face_msgs.msg import FaceCommand
 from robot_face_msgs.srv import Speak
-from robot_perception_msgs.msg import TtsRequest
+from robot_perception_msgs.msg import LanguagePreference, TtsRequest
+
+from .event_bus import get_bus
+
+# Try the typed transcript msg (bilingual builds); fall back to plain String.
+try:
+    from robot_perception_msgs.msg import Transcript
+    HAS_TYPED_TRANSCRIPT = True
+except ImportError:
+    HAS_TYPED_TRANSCRIPT = False
 
 # Graph msg/srv types are optional — only available once robot_graph_msgs
 # is built. Wrap so the daemon still starts on a partial workspace.
 try:
-    from robot_graph_msgs.msg import LocationIdentity, PersonIdentity
+    from robot_graph_msgs.msg import (
+        IdentifiedSpeech,
+        LocationIdentity,
+        PersonIdentity,
+    )
     from robot_graph_msgs.srv import (
         CypherQuery,
         FindRelated,
@@ -44,6 +59,11 @@ try:
     GRAPH_AVAILABLE = True
 except ImportError:
     GRAPH_AVAILABLE = False
+
+
+def _iso_now() -> str:
+    return _dt.datetime.now(_dt.timezone.utc).isoformat(
+        timespec="milliseconds").replace("+00:00", "Z")
 
 
 # Map state names accepted by the face MCP tool to the integer constants
@@ -71,6 +91,9 @@ class _BridgeNode(Node):
     def __init__(self) -> None:
         super().__init__("robot_mcp_bridge")
 
+        # Event bus for fanning perception updates out to WebSocket clients.
+        self._bus = get_bus()
+
         # Publishers
         self._tts_pub = self.create_publisher(TtsRequest, "/tts/say", 10)
         self._face_pub = self.create_publisher(FaceCommand, "/face/command", 10)
@@ -81,16 +104,40 @@ class _BridgeNode(Node):
         # Latest transcript cache + wakeup event for `listen()`
         self._last_transcript: Optional[str] = None
         self._transcript_event = threading.Event()
-        self.create_subscription(String, "/perception/transcript",
-                                 self._on_transcript, 10)
 
-        # Perception state caches (also used to format event payloads later).
+        # Perception state caches (also used to format event payloads).
         self._last_person: Any = None
         self._last_location: Any = None
         self._last_addressee: float = 0.5
+        self._addressee_hint: str = ""
+        self._current_language: str = "ro"
+        self._language_source: str = "default"
+        self._latest_frame_b64: Optional[str] = None
+        self._latest_frame_t: float = 0.0
 
-        # Graph service clients — created lazily when first needed so the
-        # daemon doesn't pay the setup cost if the user never asks for memory.
+        # ---- perception subscriptions (fan out to /events WS) ----
+        if HAS_TYPED_TRANSCRIPT:
+            self.create_subscription(Transcript, "/perception/transcript",
+                                     self._on_typed_transcript, 10)
+            self.create_subscription(LanguagePreference, "/language/current",
+                                     self._on_language, 10)
+        else:
+            self.create_subscription(String, "/perception/transcript",
+                                     self._on_legacy_transcript, 10)
+
+        self.create_subscription(Bool, "/perception/voice_active",
+                                 self._on_voice_active, 10)
+        self.create_subscription(Float32, "/perception/addressee_score",
+                                 self._on_addressee_score, 10)
+        self.create_subscription(String, "/perception/addressee_hint",
+                                 self._on_addressee_hint, 5)
+        self.create_subscription(String, "/agent/context_warm",
+                                 self._on_context_warm, 10)
+        self.create_subscription(UInt8MultiArray,
+                                 "/vision/frame_at_utterance",
+                                 self._on_frame, 5)
+
+        # Graph service clients — created lazily when first needed.
         self._graph_clients: dict[str, Any] = {}
 
         if GRAPH_AVAILABLE:
@@ -100,24 +147,125 @@ class _BridgeNode(Node):
             self.create_subscription(LocationIdentity,
                                      "/perception/current_location",
                                      self._on_location, 10)
-            self.create_subscription(Float32,
-                                     "/perception/addressee_score",
-                                     self._on_addressee, 10)
+            self.create_subscription(IdentifiedSpeech,
+                                     "/perception/identified_speech",
+                                     self._on_identified_speech, 10)
 
     # ---- subscriber callbacks ----
+    #
+    # Each callback both updates the local state cache AND publishes a JSON
+    # event onto the bus. The platform adapter listens on /events and turns
+    # these into Hermes MessageEvent dispatches.
 
-    def _on_transcript(self, msg: String):
-        self._last_transcript = msg.data
+    def _emit_voice(self, text: str, lang: str = "") -> None:
+        if not text:
+            return
+        self._last_transcript = text
         self._transcript_event.set()
+        event = {
+            "type": "voice",
+            "ts": _iso_now(),
+            "text": text,
+            "lang": lang or self._current_language,
+            "language_source": self._language_source,
+            "speaker_id": getattr(self._last_person, "person_id", "") if self._last_person else "",
+            "speaker_name": getattr(self._last_person, "primary_name", "") if self._last_person else "",
+            "location": (self._last_location.name if self._last_location and
+                          not getattr(self._last_location, "is_unknown", False) else ""),
+            "addressee_score": self._last_addressee,
+            "addressee_hint": self._addressee_hint,
+            "frame_b64": (self._latest_frame_b64
+                          if self._latest_frame_b64 and
+                          (time.time() - self._latest_frame_t) < 30.0
+                          else None),
+        }
+        self._bus.publish(event)
 
-    def _on_person(self, msg):
-        self._last_person = msg
+    def _on_typed_transcript(self, msg) -> None:
+        self._emit_voice(text=msg.text, lang=msg.language)
 
-    def _on_location(self, msg):
-        self._last_location = msg
+    def _on_legacy_transcript(self, msg: String) -> None:
+        self._emit_voice(text=msg.data)
 
-    def _on_addressee(self, msg: Float32):
+    def _on_language(self, msg) -> None:
+        new_lang = msg.language or self._current_language
+        if new_lang != self._current_language:
+            self._bus.publish({
+                "type": "language_changed",
+                "ts": _iso_now(),
+                "from": self._current_language,
+                "to": new_lang,
+                "source": msg.source or "",
+            })
+        self._current_language = new_lang
+        self._language_source = msg.source or self._language_source
+
+    def _on_voice_active(self, msg: Bool) -> None:
+        self._bus.publish({
+            "type": "voice_started" if msg.data else "voice_ended",
+            "ts": _iso_now(),
+        })
+
+    def _on_addressee_score(self, msg: Float32) -> None:
         self._last_addressee = float(msg.data)
+
+    def _on_addressee_hint(self, msg: String) -> None:
+        self._addressee_hint = msg.data
+
+    def _on_context_warm(self, msg: String) -> None:
+        try:
+            payload = json.loads(msg.data)
+        except json.JSONDecodeError:
+            return
+        self._bus.publish({
+            "type": "context_warm",
+            "ts": _iso_now(),
+            "payload": payload,
+        })
+
+    def _on_frame(self, msg) -> None:
+        try:
+            raw = bytes(msg.data)
+            self._latest_frame_b64 = base64.b64encode(raw).decode("ascii")
+            self._latest_frame_t = time.time()
+        except Exception:
+            self._latest_frame_b64 = None
+
+    def _on_person(self, msg) -> None:
+        prev_id = getattr(self._last_person, "person_id", None) if self._last_person else None
+        self._last_person = msg
+        if msg.person_id and msg.person_id != prev_id:
+            self._bus.publish({
+                "type": "person_identified",
+                "ts": _iso_now(),
+                "person_id": msg.person_id,
+                "name": msg.primary_name,
+                "voice_confidence": float(msg.voice_confidence),
+                "is_new": bool(msg.is_new),
+            })
+
+    def _on_location(self, msg) -> None:
+        prev_id = getattr(self._last_location, "location_id", None) if self._last_location else None
+        self._last_location = msg
+        if (not getattr(msg, "is_unknown", False)
+                and msg.location_id and msg.location_id != prev_id):
+            self._bus.publish({
+                "type": "location_changed",
+                "ts": _iso_now(),
+                "location_id": msg.location_id,
+                "name": msg.name,
+                "parent": msg.parent_name,
+                "confidence": float(msg.confidence),
+            })
+
+    def _on_identified_speech(self, msg) -> None:
+        # Authoritative source when speaker is known. Updates the person
+        # cache and emits a voice event with the speaker pre-resolved.
+        if msg.speaker and msg.speaker.person_id:
+            self._last_person = msg.speaker
+        if msg.location and not getattr(msg.location, "is_unknown", False):
+            self._last_location = msg.location
+        self._emit_voice(text=msg.text, lang=self._current_language)
 
     # ---- outbound ----
 
