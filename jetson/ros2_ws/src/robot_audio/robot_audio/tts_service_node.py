@@ -272,8 +272,9 @@ class TtsService(Node):
             self._emit_chunk(bytes(buf))
 
     def _emit_chunk(self, pcm_bytes: bytes):
+        # ROS2 ByteMultiArray expects a sequence of length-1 `bytes` objects.
         msg = ByteMultiArray()
-        msg.data = list(pcm_bytes)
+        msg.data = [bytes((b,)) for b in pcm_bytes]
         self._stream_pub.publish(msg)
 
     def _emit_status(self, status: str):

@@ -51,9 +51,12 @@ class AudioCapture(Node):
         if status:
             self.get_logger().warning(str(status))
 
-        # Publish raw PCM
+        # Publish raw PCM. ROS2 ByteMultiArray.data requires a list/sequence
+        # where each element is a `bytes` object of length 1 (rosidl octet
+        # array binding). Build it once per chunk.
+        raw = indata.tobytes()
         msg = ByteMultiArray()
-        msg.data = indata.tobytes()
+        msg.data = [bytes((b,)) for b in raw]
         self._chunk_pub.publish(msg)
 
         # Publish level (RMS, 0..1)

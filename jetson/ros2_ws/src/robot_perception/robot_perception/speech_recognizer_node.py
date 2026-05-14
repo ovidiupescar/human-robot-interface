@@ -41,9 +41,14 @@ class SpeechRecognizer(Node):
 
     def __init__(self):
         super().__init__('speech_recognizer')
-        self.declare_parameter('model_size', 'small')
-        self.declare_parameter('device', 'cuda')
-        self.declare_parameter('compute_type', 'int8_float16')
+        # Defaults tuned for Jetson Orin Nano: PyPI ctranslate2 wheels are
+        # CPU-only on ARM64 Tegra, so device='cpu' avoids a CUDA-missing
+        # crash. 'medium' int8 gives noticeably better Romanian accuracy
+        # than 'small' at roughly real-time on Orin CPU. Override via
+        # launch params if running on a host with GPU-enabled ctranslate2.
+        self.declare_parameter('model_size', 'medium')
+        self.declare_parameter('device', 'cpu')
+        self.declare_parameter('compute_type', 'int8')
         self.declare_parameter('allowed_languages', ['ro', 'en'])
         self.declare_parameter('default_language', 'ro')
         self.declare_parameter('sample_rate', 16000)
