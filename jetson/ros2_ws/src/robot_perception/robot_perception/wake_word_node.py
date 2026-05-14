@@ -1,6 +1,6 @@
 """Wake-word detector.
 
-Subscribes:  /audio/chunk (ByteMultiArray, int16 PCM)
+Subscribes:  /audio/chunk (UInt8MultiArray, int16 PCM)
 Publishes:   /perception/wake_word (String — fires on detection)
 
 Backend: openWakeWord (pip install openwakeword) — light, runs on CPU.
@@ -13,7 +13,7 @@ Stub mode (when openwakeword not installed): always silent.
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import ByteMultiArray, String
+from std_msgs.msg import UInt8MultiArray, String
 
 try:
     from openwakeword.model import Model as WakeModel
@@ -31,7 +31,7 @@ class WakeWord(Node):
         self.threshold = float(self.get_parameter('threshold').value)
         self.sr = int(self.get_parameter('sample_rate').value)
 
-        self.create_subscription(ByteMultiArray, '/audio/chunk', self._on_chunk, 50)
+        self.create_subscription(UInt8MultiArray, '/audio/chunk', self._on_chunk, 50)
         self._pub = self.create_publisher(String, '/perception/wake_word', 10)
 
         self._model = None
@@ -48,7 +48,7 @@ class WakeWord(Node):
             except Exception as e:
                 self.get_logger().error(f'wake model load failed: {e}')
 
-    def _on_chunk(self, msg: ByteMultiArray):
+    def _on_chunk(self, msg: UInt8MultiArray):
         if self._model is None:
             return
         try:

@@ -1,15 +1,15 @@
 """Voice Activity Detection (VAD).
 
-Subscribes:  /audio/chunk (std_msgs/ByteMultiArray) — raw PCM int16 mono
-             /audio/level (std_msgs/Float32)        — RMS level
+Subscribes:  /audio/level (std_msgs/Float32)        — RMS level
 Publishes:   /perception/voice_active (std_msgs/Bool) — edge events on change
 
-Simple energy-based VAD. Swap for silero-vad or webrtcvad for production.
+Simple energy-based VAD on the precomputed RMS level. Swap for silero-vad
+or webrtcvad if you ever need to read raw PCM here.
 """
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Bool, ByteMultiArray, Float32
+from std_msgs.msg import Bool, Float32
 
 
 class VoiceActivity(Node):
