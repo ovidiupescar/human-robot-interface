@@ -4,13 +4,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "robot_bridge"
-version = "0.1.0"
-description = "Python helper library for robot skills — wraps ROS2 (rclpy) calls behind a clean API"
+version = "0.2.0"
+description = "Hermes-side facade that proxies skill calls to ros2_bridge_daemon over MCP. No rclpy import — runs cleanly in Hermes's Python 3.11 venv."
 authors = [{ name = "Ovidiu Pescar", email = "ovidiu@artoriuslabs.com" }]
 license = { text = "MIT" }
 requires-python = ">=3.10"
 dependencies = [
-    # rclpy is provided by the system ROS2 install, not pip
+    # We POST JSON-RPC envelopes to the daemon's MCP Streamable HTTP
+    # endpoint; httpx is the lightest HTTP client that handles both
+    # JSON and SSE response bodies cleanly.
+    "httpx>=0.28",
 ]
 
 [tool.setuptools.packages.find]

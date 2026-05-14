@@ -1,344 +1,260 @@
-"""RobotBridge — singleton facade used by Hermes skill scripts.
+"""RobotBridge — thin MCP-client facade for Hermes skill scripts.
 
-All Hermes skills import this and call its methods. It manages a single rclpy
-node that talks to the live ROS2 graph (face, speech, knowledge graph services,
-journal).
+Same public API as the old rclpy-based RobotBridge (set_face, speak,
+who_is_here, register_person, …). Internally, every method dispatches a
+single MCP `tools/call` to the ros2_bridge_daemon running in system
+Python 3.10 on http://127.0.0.1:8765/mcp-http/mcp. That keeps rclpy out
+of the Hermes Python 3.11 venv where this module is installed.
+
+Each `RobotBridge()` call returns a singleton that reuses one MCP session
+across multiple tool invocations from the same skill subprocess. Skill
+scripts continue to write:
+
+    from robot_bridge import RobotBridge
+    rb = RobotBridge()
+    print(rb.speak("hello"))
+
+with no other changes. The return values are now dicts (matching the
+daemon's tool surface) rather than the prior bespoke strings; skill
+scripts already `print(...)` the return value, so JSON dicts are at
+least as readable.
 """
 
 from __future__ import annotations
 
-import gzip
-import json
+import asyncio
+import os
 import threading
-import time
-from datetime import datetime
-from pathlib import Path
 from typing import Any, Optional
 
-import rclpy
-from rclpy.node import Node
-from rclpy.executors import SingleThreadedExecutor
-from std_msgs.msg import Float32, String
-
-from robot_face_msgs.msg import FaceCommand
-from robot_face_msgs.srv import Speak
-
-# Optional — only available once robot_graph_msgs is built
-try:
-    from robot_graph_msgs.msg import LocationIdentity, PersonIdentity
-    from robot_graph_msgs.srv import (
-        CypherQuery,
-        FindRelated,
-        ForgetPerson,
-        IdentifyLocation,
-        LearnLocation,
-        ListLocations,
-        ListPersons,
-        Recall,
-        Relate,
-        RegisterPerson,
-        Remember,
-        RenamePerson,
-        SetCurrentLocation,
-    )
-    GRAPH_AVAILABLE = True
-except ImportError:
-    GRAPH_AVAILABLE = False
-
-from .states import STATE_NAME_TO_INT, FaceStateName
+# We avoid taking a hard dependency on the official mcp client SDK here —
+# it pulls in a large async stack we don't need for one-shot tool calls.
+# A raw httpx POST against the Streamable HTTP endpoint with the right
+# headers is sufficient.
+import httpx
 
 
-class _BridgeNode(Node):
-    def __init__(self):
-        super().__init__('hermes_robot_bridge')
+MCP_URL = os.environ.get("ROS2_BRIDGE_MCP_URL",
+                          "http://127.0.0.1:8765/mcp-http/mcp")
+TIMEOUT_S = float(os.environ.get("ROS2_BRIDGE_TIMEOUT_S", "10"))
 
-        # Face
-        self._face_pub = self.create_publisher(FaceCommand, '/face/command', 10)
 
-        # Speech
-        self._speak_cli = self.create_client(Speak, '/speak')
-
-        # Transcripts
-        self._last_transcript: Optional[str] = None
-        self._transcript_event = threading.Event()
-        self.create_subscription(String, '/perception/transcript',
-                                 self._on_transcript, 10)
-
-        # Current state caches
-        self._last_person: Optional[Any] = None
-        self._last_location: Optional[Any] = None
-        self._last_addressee: float = 0.5
-
-        if GRAPH_AVAILABLE:
-            self.create_subscription(PersonIdentity,
-                                     '/perception/identified_person',
-                                     self._on_person, 10)
-            self.create_subscription(LocationIdentity,
-                                     '/perception/current_location',
-                                     self._on_location, 10)
-            self.create_subscription(Float32,
-                                     '/perception/addressee_score',
-                                     self._on_addressee, 10)
-
-            self._identify_voice_cli = None  # built-on-demand
-            self._register_person_cli = self.create_client(RegisterPerson,
-                                                            '/identity/register_person')
-            self._rename_person_cli = self.create_client(RenamePerson,
-                                                         '/identity/rename_person')
-            self._list_persons_cli = self.create_client(ListPersons,
-                                                        '/identity/list_persons')
-            self._forget_person_cli = self.create_client(ForgetPerson,
-                                                         '/identity/forget_person')
-
-            self._identify_loc_cli = self.create_client(IdentifyLocation,
-                                                        '/location/identify')
-            self._learn_loc_cli = self.create_client(LearnLocation,
-                                                     '/location/learn')
-            self._list_loc_cli = self.create_client(ListLocations,
-                                                    '/location/list')
-            self._set_loc_cli = self.create_client(SetCurrentLocation,
-                                                   '/location/set_current')
-
-            self._remember_cli = self.create_client(Remember, '/memory/remember')
-            self._recall_cli = self.create_client(Recall, '/memory/recall')
-            self._relate_cli = self.create_client(Relate, '/memory/relate')
-            self._find_related_cli = self.create_client(FindRelated,
-                                                         '/memory/find_related')
-            self._cypher_cli = self.create_client(CypherQuery, '/graph/cypher')
-
-    def _on_transcript(self, msg: String):
-        self._last_transcript = msg.data
-        self._transcript_event.set()
-
-    def _on_person(self, msg):
-        self._last_person = msg
-
-    def _on_location(self, msg):
-        self._last_location = msg
-
-    def _on_addressee(self, msg: Float32):
-        self._last_addressee = float(msg.data)
+class _MCPError(Exception):
+    pass
 
 
 class RobotBridge:
-    """Thread-safe singleton wrapping a long-lived rclpy node."""
+    """Thread-safe singleton dispatching tool calls to ros2_bridge_daemon."""
 
     _instance: Optional["RobotBridge"] = None
-    _lock = threading.Lock()
+    _instance_lock = threading.Lock()
 
-    def __new__(cls):
-        with cls._lock:
+    def __new__(cls) -> "RobotBridge":
+        with cls._instance_lock:
             if cls._instance is None:
                 cls._instance = super().__new__(cls)
                 cls._instance._init()
         return cls._instance
 
-    def _init(self):
-        if not rclpy.ok():
-            rclpy.init()
-        self._node = _BridgeNode()
-        self._executor = SingleThreadedExecutor()
-        self._executor.add_node(self._node)
-        self._spin = threading.Thread(target=self._executor.spin, daemon=True)
-        self._spin.start()
+    def _init(self) -> None:
+        self._session_id: Optional[str] = None
+        self._next_id = 1
+        self._call_lock = threading.Lock()
 
-    # ---- helpers ----
+    # ---- protocol plumbing ----
 
-    def _call(self, client, request, timeout: float = 10.0):
-        if not client.wait_for_service(timeout_sec=2.0):
-            return None
-        future = client.call_async(request)
-        deadline = time.time() + timeout
-        while time.time() < deadline and not future.done():
-            time.sleep(0.02)
-        return future.result()
+    def _next_rpc_id(self) -> int:
+        with self._call_lock:
+            n = self._next_id
+            self._next_id += 1
+            return n
 
-    # ---- face ----
+    def _post(self, payload: dict, extra_headers: Optional[dict] = None
+              ) -> tuple[int, dict, dict]:
+        headers = {
+            "Content-Type": "application/json",
+            # Streamable HTTP servers may reply with either content type;
+            # accept both per the MCP spec.
+            "Accept": "application/json, text/event-stream",
+        }
+        if self._session_id:
+            headers["Mcp-Session-Id"] = self._session_id
+        if extra_headers:
+            headers.update(extra_headers)
+        with httpx.Client(timeout=TIMEOUT_S) as client:
+            resp = client.post(MCP_URL, json=payload, headers=headers)
+        # Some servers stash the session id in a response header on init.
+        sid = resp.headers.get("Mcp-Session-Id") or resp.headers.get("mcp-session-id")
+        if sid:
+            self._session_id = sid
+        return resp.status_code, dict(resp.headers), self._parse_body(resp)
 
-    def set_face(self, state: FaceStateName, amplitude: float = 0.0) -> str:
-        if state not in STATE_NAME_TO_INT:
-            return f"error: unknown state '{state}'"
-        m = FaceCommand()
-        m.state = STATE_NAME_TO_INT[state]
-        m.amplitude = max(0.0, min(1.0, float(amplitude)))
-        self._node._face_pub.publish(m)
-        return f"face -> {state}"
+    @staticmethod
+    def _parse_body(resp: httpx.Response) -> dict:
+        ct = (resp.headers.get("content-type") or "").lower()
+        if "application/json" in ct:
+            try:
+                return resp.json()
+            except Exception:
+                return {"raw": resp.text}
+        # SSE: pluck the first `data: {...}` line.
+        for line in resp.text.splitlines():
+            if line.startswith("data: "):
+                import json as _json
+                try:
+                    return _json.loads(line[len("data: "):])
+                except Exception:
+                    continue
+        return {"raw": resp.text}
 
-    # ---- speech ----
+    def _initialize(self) -> None:
+        if self._session_id is not None:
+            return
+        init_req = {
+            "jsonrpc": "2.0",
+            "id": self._next_rpc_id(),
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "robot_bridge",
+                                "version": "0.2.0"},
+            },
+        }
+        self._post(init_req)
+        # Send the 'initialized' notification (required by spec).
+        self._post({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+            "params": {},
+        })
 
-    def speak(self, text: str, timeout_seconds: float = 30.0) -> str:
-        req = Speak.Request()
-        req.text = text
-        resp = self._call(self._node._speak_cli, req, timeout=timeout_seconds)
-        if resp is None:
-            return "error: speak unavailable or timed out"
-        return (f"spoke ({resp.duration_seconds:.2f}s)"
-                if resp.success else f"error: {resp.message}")
+    def _call_tool(self, name: str, arguments: Optional[dict] = None
+                    ) -> Any:
+        self._initialize()
+        rpc_id = self._next_rpc_id()
+        envelope = {
+            "jsonrpc": "2.0",
+            "id": rpc_id,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": arguments or {}},
+        }
+        status, _headers, body = self._post(envelope)
+        if status >= 400:
+            raise _MCPError(f"HTTP {status}: {body}")
+        if "error" in body:
+            return {"ok": False, "error": body["error"]}
+        # MCP tools/call result: {result: {content: [{type:'text',text:JSON}], ...}}
+        result = body.get("result") or {}
+        content = result.get("content") or []
+        if content and isinstance(content[0], dict):
+            text = content[0].get("text", "")
+            if text:
+                import json as _json
+                try:
+                    return _json.loads(text)
+                except _json.JSONDecodeError:
+                    return {"ok": True, "raw": text}
+        return result
+
+    # ============================================================
+    # Public API — same names as the old RobotBridge so existing skill
+    # scripts continue to work. Return values are JSON dicts.
+    # ============================================================
+
+    # ---- face / speech ----
+
+    def set_face(self, state: str, amplitude: float = 0.0) -> dict:
+        return self._call_tool("set_face",
+                                 {"state": state, "amplitude": float(amplitude)})
+
+    def speak(self, text: str, timeout_seconds: float = 30.0) -> dict:
+        # The fire-and-forget tool. For blocking speak use speak_sync.
+        return self._call_tool("speak", {"text": text})
+
+    def speak_sync(self, text: str, timeout_seconds: float = 30.0) -> dict:
+        return self._call_tool("speak_sync",
+                                 {"text": text,
+                                  "timeout_seconds": float(timeout_seconds)})
 
     def listen(self, timeout_seconds: float = 15.0) -> str:
-        self._node._transcript_event.clear()
-        self._node._last_transcript = None
-        if self._node._transcript_event.wait(timeout=timeout_seconds):
-            return self._node._last_transcript or ""
-        return ""
+        result = self._call_tool("listen",
+                                   {"timeout_seconds": float(timeout_seconds)})
+        return result.get("text", "") if isinstance(result, dict) else str(result)
 
     # ---- identity ----
 
     def who_is_here(self) -> dict:
-        p = self._node._last_person
-        if p is None:
-            return {"present": False}
-        return {
-            "present": True,
-            "person_id": p.person_id,
-            "name": p.primary_name,
-            "voice_confidence": float(p.voice_confidence),
-            "is_new": bool(p.is_new),
-        }
+        return self._call_tool("who_is_here", {})
 
     def register_person(self, name: str) -> dict:
-        if not GRAPH_AVAILABLE:
-            return {"success": False, "message": "graph msgs not built"}
-        req = RegisterPerson.Request()
-        req.name = name
-        req.audio_pcm_int16 = []
-        req.sample_rate = 16000
-        resp = self._call(self._node._register_person_cli, req)
-        if resp is None:
-            return {"success": False, "message": "service unavailable"}
-        return {"success": resp.success, "message": resp.message,
-                "person_id": resp.identity.person_id, "name": resp.identity.primary_name}
+        return self._call_tool("register_person", {"name": name})
 
     def list_persons(self) -> list:
-        if not GRAPH_AVAILABLE:
-            return []
-        resp = self._call(self._node._list_persons_cli, ListPersons.Request())
-        if resp is None:
-            return []
-        return [{"id": p.person_id, "name": p.primary_name} for p in resp.persons]
+        result = self._call_tool("list_persons", {})
+        return result.get("persons", []) if isinstance(result, dict) else []
 
     def forget_person(self, person_id: str) -> dict:
-        if not GRAPH_AVAILABLE:
-            return {"success": False, "message": "graph msgs not built"}
-        req = ForgetPerson.Request()
-        req.person_id = person_id
-        resp = self._call(self._node._forget_person_cli, req)
-        return {"success": bool(resp and resp.success),
-                "message": resp.message if resp else ""}
+        return self._call_tool("forget_person", {"person_id": person_id})
 
     # ---- location ----
 
     def where_am_i(self) -> dict:
-        l = self._node._last_location
-        if l is None or getattr(l, 'is_unknown', True):
-            return {"known": False}
-        return {"known": True, "location_id": l.location_id, "name": l.name,
-                "parent": l.parent_name, "confidence": float(l.confidence)}
+        return self._call_tool("where_am_i", {})
 
     def learn_location(self, name: str, parent: str = "") -> dict:
-        if not GRAPH_AVAILABLE:
-            return {"success": False, "message": "graph msgs not built"}
-        req = LearnLocation.Request()
-        req.name = name
-        req.parent_name = parent
-        req.sample_count = 5
-        resp = self._call(self._node._learn_loc_cli, req)
-        return {"success": bool(resp and resp.success),
-                "message": resp.message if resp else "",
-                "location_id": resp.identity.location_id if resp else ""}
+        return self._call_tool("learn_location",
+                                 {"name": name, "parent": parent})
 
     def set_current_location(self, name: str, parent: str = "") -> dict:
-        if not GRAPH_AVAILABLE:
-            return {"success": False, "message": "graph msgs not built"}
-        req = SetCurrentLocation.Request()
-        req.name = name
-        req.parent_name = parent
-        resp = self._call(self._node._set_loc_cli, req)
-        return {"success": bool(resp and resp.success),
-                "message": resp.message if resp else "",
-                "location_id": resp.identity.location_id if resp else ""}
+        return self._call_tool("set_current_location",
+                                 {"name": name, "parent": parent})
 
     def list_locations(self) -> list:
-        if not GRAPH_AVAILABLE:
-            return []
-        resp = self._call(self._node._list_loc_cli, ListLocations.Request())
-        if resp is None:
-            return []
-        return [{"id": l.location_id, "name": l.name, "parent": l.parent_name}
-                for l in resp.locations]
+        result = self._call_tool("list_locations", {})
+        return result.get("locations", []) if isinstance(result, dict) else []
 
     # ---- memory ----
 
     def remember(self, subject_id: str, subject_type: str, content: str,
                  tags: str = "", source: str = "manual",
                  confidence: float = 1.0) -> dict:
-        if not GRAPH_AVAILABLE:
-            return {"success": False}
-        req = Remember.Request()
-        req.subject_id = subject_id
-        req.subject_type = subject_type
-        req.content = content
-        req.tags = tags
-        req.source = source
-        req.confidence = confidence
-        resp = self._call(self._node._remember_cli, req)
-        return {"success": bool(resp and resp.success),
-                "fact_id": resp.fact_id if resp else ""}
+        return self._call_tool("remember",
+            {"subject_id": subject_id, "subject_type": subject_type,
+             "content": content, "tags": tags, "source": source,
+             "confidence": float(confidence)})
 
     def recall(self, subject_id: str, subject_type: str = "Person",
                query: str = "", limit: int = 10) -> list:
-        if not GRAPH_AVAILABLE:
-            return []
-        req = Recall.Request()
-        req.subject_id = subject_id
-        req.subject_type = subject_type
-        req.query = query
-        req.limit = limit
-        resp = self._call(self._node._recall_cli, req)
-        if resp is None:
-            return []
-        out = []
-        for fid, content, score in zip(resp.fact_ids, resp.contents, resp.scores):
-            out.append({"id": fid, "content": content, "score": float(score)})
-        return out
+        result = self._call_tool("recall",
+            {"subject_id": subject_id, "subject_type": subject_type,
+             "query": query, "limit": int(limit)})
+        return result.get("facts", []) if isinstance(result, dict) else []
 
     def relate_persons(self, a_id: str, b_id: str, relation: str,
-                       description: str = "", bidirectional: bool = False) -> dict:
-        if not GRAPH_AVAILABLE:
-            return {"success": False}
-        req = Relate.Request()
-        req.subject_a_id = a_id
-        req.subject_b_id = b_id
-        req.subject_type = "Person"
-        req.relation = relation
-        req.description = description
-        req.bidirectional = bidirectional
-        resp = self._call(self._node._relate_cli, req)
-        return {"success": bool(resp and resp.success)}
+                       description: str = "",
+                       bidirectional: bool = False) -> dict:
+        return self._call_tool("relate_persons",
+            {"a_id": a_id, "b_id": b_id, "relation": relation,
+             "description": description, "bidirectional": bool(bidirectional)})
 
     def find_related(self, subject_id: str, relation: str = "",
                      hops: int = 1) -> list:
-        if not GRAPH_AVAILABLE:
-            return []
-        req = FindRelated.Request()
-        req.subject_id = subject_id
-        req.subject_type = "Person"
-        req.relation = relation
-        req.hops = hops
-        resp = self._call(self._node._find_related_cli, req)
-        if resp is None:
-            return []
-        return [{"id": i, "name": n} for i, n in
-                zip(resp.related_ids, resp.related_names)]
+        result = self._call_tool("find_related",
+            {"subject_id": subject_id, "relation": relation,
+             "hops": int(hops)})
+        return result.get("related", []) if isinstance(result, dict) else []
 
-    # ---- self ----
+    # ---- self (Cypher-backed convenience methods) ----
 
     def who_am_i(self) -> dict:
-        # Query :Self node via Cypher
-        result = self._cypher(
-            "MATCH (s:Self) RETURN s.id, s.name, s.owner_id, s.preferences",
-            {})
-        rows = result.get("rows", [])
+        # The MCP daemon doesn't expose a 'who_am_i' tool; build it via
+        # cypher() so the surface stays identical.
+        result = self._call_tool("cypher", {
+            "query": "MATCH (s:Self) RETURN s.id, s.name, s.owner_id, s.preferences",
+            "params": {},
+        })
+        rows = result.get("rows", []) if isinstance(result, dict) else []
         if not rows:
             return {"name": "Hermes", "preferences": "{}"}
         sid, name, owner, prefs = rows[0]
@@ -346,120 +262,110 @@ class RobotBridge:
                 "preferences": prefs}
 
     def update_self_preferences(self, prefs: dict) -> dict:
+        import json as _json
         cur = self.who_am_i()
         try:
-            existing = json.loads(cur.get("preferences", "{}"))
-        except json.JSONDecodeError:
+            existing = _json.loads(cur.get("preferences", "{}"))
+        except _json.JSONDecodeError:
             existing = {}
         existing.update(prefs)
-        result = self._cypher(
-            "MERGE (s:Self {id:'self'}) "
-            "SET s.preferences=$prefs, s.name=COALESCE(s.name, 'Hermes')",
-            {"prefs": json.dumps(existing)},
-        )
-        return result
+        return self._call_tool("cypher", {
+            "query": ("MERGE (s:Self {id:'self'}) "
+                      "SET s.preferences=$prefs, "
+                      "s.name=COALESCE(s.name, 'Hermes')"),
+            "params": {"prefs": _json.dumps(existing)},
+        })
 
     def add_self_fact(self, content: str) -> dict:
-        return self.remember("self", "Self", content, source="self-reflection")
+        return self.remember("self", "Self", content,
+                              source="self-reflection")
 
-    def _cypher(self, cypher: str, params: dict) -> dict:
-        if not GRAPH_AVAILABLE:
-            return {"success": False, "rows": []}
-        req = CypherQuery.Request()
-        req.cypher = cypher
-        req.params_json = json.dumps(params)
-        resp = self._call(self._node._cypher_cli, req)
-        if resp is None:
-            return {"success": False, "rows": []}
-        try:
-            rows = json.loads(resp.result_json)
-        except json.JSONDecodeError:
-            rows = []
-        return {"success": resp.success, "message": resp.message, "rows": rows}
-
-    # ---- journal ----
+    # ---- journal (file-based, no rclpy needed) ----
+    #
+    # The journal files live on the same host the daemon runs on, so we
+    # read them directly here. This keeps the call cheap (no MCP round
+    # trip for what's essentially a local file read).
 
     def read_journal_windows(self, mode: str = "incremental",
                               max_entries: int = 500) -> list:
-        """Read journal entries since checkpoint and split into silence-bounded windows.
+        import gzip
+        import json as _json
+        from datetime import datetime
+        from pathlib import Path
 
-        For now reads from disk directly (~/robot_data/journal/).
-        Production: also call /memorist/read_window service for atomic checkpointing.
-        """
-        journal_dir = Path.home() / 'robot_data' / 'journal'
+        journal_dir = Path.home() / "robot_data" / "journal"
         if not journal_dir.exists():
             return []
 
-        checkpoint_file = journal_dir / 'checkpoint.json'
-        try:
-            checkpoint = json.loads(checkpoint_file.read_text()) if checkpoint_file.exists() else {}
-        except json.JSONDecodeError:
-            checkpoint = {}
+        def load_day(date: str) -> list:
+            plain = journal_dir / f"{date}.jsonl"
+            gz = journal_dir / f"{date}.jsonl.gz"
+            if plain.exists():
+                opener = lambda: open(plain, "r", encoding="utf-8")
+            elif gz.exists():
+                opener = lambda: gzip.open(gz, "rt", encoding="utf-8")
+            else:
+                return []
+            out = []
+            with opener() as f:
+                for line in f:
+                    try:
+                        out.append(_json.loads(line))
+                    except _json.JSONDecodeError:
+                        continue
+            return out
+
+        def bucketize(entries: list, gap_seconds: int = 300) -> list:
+            if not entries:
+                return []
+            windows = []
+            current = [entries[0]]
+            for prev, cur in zip(entries, entries[1:]):
+                try:
+                    dt_prev = datetime.fromisoformat(
+                        prev["t"].replace("Z", "+00:00"))
+                    dt_cur = datetime.fromisoformat(
+                        cur["t"].replace("Z", "+00:00"))
+                except (KeyError, ValueError):
+                    current.append(cur)
+                    continue
+                if (dt_cur - dt_prev).total_seconds() > gap_seconds:
+                    windows.append(current)
+                    current = []
+                current.append(cur)
+            if current:
+                windows.append(current)
+            return [{"start": w[0]["t"], "end": w[-1]["t"],
+                      "entries": w} for w in windows]
 
         if mode == "daily":
-            # Last full day's file
-            target_date = (datetime.now()).strftime('%Y-%m-%d')
-            return self._load_day(journal_dir, target_date)
+            target_date = datetime.now().strftime("%Y-%m-%d")
+            return load_day(target_date)
 
-        # Incremental — read today since checkpoint
-        last_t = checkpoint.get('last_timestamp', '')
-        entries = self._load_day(journal_dir, datetime.now().strftime('%Y-%m-%d'))
-        entries = [e for e in entries if e.get('t', '') > last_t]
-        return self._bucketize(entries[:max_entries])
-
-    def _load_day(self, journal_dir: Path, date: str) -> list:
-        plain = journal_dir / f'{date}.jsonl'
-        gz = journal_dir / f'{date}.jsonl.gz'
-        if plain.exists():
-            opener = lambda: open(plain, 'r', encoding='utf-8')
-        elif gz.exists():
-            opener = lambda: gzip.open(gz, 'rt', encoding='utf-8')
-        else:
-            return []
-        out = []
-        with opener() as f:
-            for line in f:
-                try:
-                    out.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
-        return out
-
-    def _bucketize(self, entries: list, gap_seconds: int = 300) -> list:
-        if not entries:
-            return []
-        windows = []
-        current = [entries[0]]
-        for prev, cur in zip(entries, entries[1:]):
-            try:
-                dt_prev = datetime.fromisoformat(prev['t'].replace('Z', '+00:00'))
-                dt_cur = datetime.fromisoformat(cur['t'].replace('Z', '+00:00'))
-            except (KeyError, ValueError):
-                current.append(cur)
-                continue
-            if (dt_cur - dt_prev).total_seconds() > gap_seconds:
-                windows.append(current)
-                current = []
-            current.append(cur)
-        if current:
-            windows.append(current)
-        return [{"start": w[0]['t'], "end": w[-1]['t'], "entries": w}
-                for w in windows]
+        checkpoint_file = journal_dir / "checkpoint.json"
+        try:
+            checkpoint = (_json.loads(checkpoint_file.read_text())
+                          if checkpoint_file.exists() else {})
+        except _json.JSONDecodeError:
+            checkpoint = {}
+        last_t = checkpoint.get("last_timestamp", "")
+        entries = load_day(datetime.now().strftime("%Y-%m-%d"))
+        entries = [e for e in entries if e.get("t", "") > last_t]
+        return bucketize(entries[:max_entries])
 
     def forget_day(self, date: str) -> dict:
-        """Delete journal file for date + remove Episodes that day from graph."""
-        journal_dir = Path.home() / 'robot_data' / 'journal'
+        from pathlib import Path
+        journal_dir = Path.home() / "robot_data" / "journal"
         deleted = []
-        for path in (journal_dir / f'{date}.jsonl',
-                     journal_dir / f'{date}.jsonl.gz'):
+        for path in (journal_dir / f"{date}.jsonl",
+                      journal_dir / f"{date}.jsonl.gz"):
             if path.exists():
                 path.unlink()
                 deleted.append(path.name)
-        # Cascade in graph
-        result = self._cypher(
-            "MATCH (e:Episode) "
-            "WHERE date(e.occurred_at) = date($d) "
-            "DETACH DELETE e",
-            {"d": date},
-        )
+        result = self._call_tool("cypher", {
+            "query": ("MATCH (e:Episode) "
+                      "WHERE date(e.occurred_at) = date($d) "
+                      "DETACH DELETE e"),
+            "params": {"d": date},
+        })
         return {"deleted_files": deleted, "graph": result}
