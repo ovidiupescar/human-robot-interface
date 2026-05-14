@@ -244,7 +244,16 @@ def build_app() -> FastAPI:
         version="0.1.0",
         lifespan=lifespan,
     )
+    # Legacy SSE transport — mounted at /mcp/sse (the GET stream) and
+    # /mcp/messages/ (the POST endpoint).
     app.mount("/mcp", mcp.sse_app())
+    # Modern Streamable HTTP transport — single bidirectional endpoint.
+    # Hermes Agent's `hermes mcp add --url` expects this layout.
+    try:
+        app.mount("/mcp-http", mcp.streamable_http_app())
+    except AttributeError:
+        # Older mcp SDK without streamable_http_app — SSE still works.
+        pass
 
     @app.get("/healthz")
     def healthz():
