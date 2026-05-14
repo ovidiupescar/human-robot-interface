@@ -16,6 +16,7 @@ import logging
 import signal
 import sys
 from contextlib import asynccontextmanager
+from typing import Optional
 
 import uvicorn
 from fastapi import FastAPI
@@ -25,34 +26,204 @@ from robot_mcp_bridge.ros_node import RosBridge
 
 log = logging.getLogger("robot_mcp_bridge")
 
-# --- MCP tool surface -------------------------------------------------------
+# ============================================================
+# MCP tool surface
+#
+# Each tool is a thin function wrapping a RosBridge method. Tools are
+# intentionally chatty in their type hints/docstrings — the docstring is
+# the LLM's only documentation, so it pays to spell out what each arg
+# accepts and what shape comes back.
+# ============================================================
 
 mcp = FastMCP("robot")
 
 
+# ---- face / speech ---------------------------------------------------------
+
+
 @mcp.tool()
 def speak(text: str, language: str = "", voice: str = "") -> dict:
-    """Speak `text` through the robot's TTS pipeline.
+    """Speak `text` through the robot's TTS pipeline (fire-and-forget).
 
     Args:
-        text: The utterance to synthesize. Empty string is a no-op.
+        text: The utterance. Empty string is a no-op.
         language: 'ro' or 'en'. Empty = use current language preference.
-        voice: Override the engine's default voice for the chosen language.
-               Empty = engine default.
+        voice: Override the engine's default voice for the language.
 
     Returns:
-        {"ok": bool, "text": str, "language": str}
+        {"ok": bool, "text": str, "language": str} or {"ok": False, "error": str}
     """
     return RosBridge().speak(text=text, language=language, voice=voice)
 
 
-# --- FastAPI app ------------------------------------------------------------
+@mcp.tool()
+def speak_sync(text: str, timeout_seconds: float = 30.0) -> dict:
+    """Speak `text` and BLOCK until synthesis finishes.
+
+    Calls the legacy /speak service. Prefer `speak()` for low-latency
+    streaming output; use this when you need to know when the utterance
+    is done (e.g., to chain a follow-up action).
+    """
+    return RosBridge().speak_sync(text=text, timeout_seconds=timeout_seconds)
+
+
+@mcp.tool()
+def set_face(state: str, amplitude: float = 0.0) -> dict:
+    """Set the ESP32 face state.
+
+    Args:
+        state: One of: standby, listening, speaking, processing, error, happy, sad.
+        amplitude: 0.0-1.0 — used by speaking/listening for mouth movement intensity.
+
+    Returns:
+        {"ok": bool, "state": str, "amplitude": float}
+    """
+    return RosBridge().set_face(state=state, amplitude=amplitude)
+
+
+@mcp.tool()
+def listen(timeout_seconds: float = 15.0) -> dict:
+    """Wait for the next final transcript from the STT pipeline.
+
+    Returns the transcript text or an empty result on timeout. Does not
+    re-start the mic — capture is always running in audio_capture_node.
+    """
+    return RosBridge().listen(timeout_seconds=timeout_seconds)
+
+
+# ---- identity --------------------------------------------------------------
+
+
+@mcp.tool()
+def who_is_here() -> dict:
+    """Return the most recently identified person, if any.
+
+    {"present": False} when nobody has been identified yet, otherwise:
+    {"present": True, "person_id", "name", "voice_confidence", "is_new"}.
+    """
+    return RosBridge().who_is_here()
+
+
+@mcp.tool()
+def register_person(name: str) -> dict:
+    """Enroll the currently speaking person under `name`."""
+    return RosBridge().register_person(name=name)
+
+
+@mcp.tool()
+def list_persons() -> dict:
+    """List all known persons in the identity graph."""
+    return RosBridge().list_persons()
+
+
+@mcp.tool()
+def forget_person(person_id: str) -> dict:
+    """Remove a person and their relations from the graph."""
+    return RosBridge().forget_person(person_id=person_id)
+
+
+# ---- location --------------------------------------------------------------
+
+
+@mcp.tool()
+def where_am_i() -> dict:
+    """Return the current physical location of the robot.
+
+    {"known": False} when unknown, else:
+    {"known": True, "location_id", "name", "parent", "confidence"}.
+    """
+    return RosBridge().where_am_i()
+
+
+@mcp.tool()
+def learn_location(name: str, parent: str = "") -> dict:
+    """Sample the current visual scene and bind it to a new named location."""
+    return RosBridge().learn_location(name=name, parent=parent)
+
+
+@mcp.tool()
+def set_current_location(name: str, parent: str = "") -> dict:
+    """Manually set the robot's current location by name (overrides recognition)."""
+    return RosBridge().set_current_location(name=name, parent=parent)
+
+
+@mcp.tool()
+def list_locations() -> dict:
+    """List all known locations in the graph."""
+    return RosBridge().list_locations()
+
+
+# ---- memory ----------------------------------------------------------------
+
+
+@mcp.tool()
+def remember(subject_id: str, subject_type: str, content: str,
+              tags: str = "", source: str = "manual",
+              confidence: float = 1.0) -> dict:
+    """Store a fact about a subject (person, location, self, ...).
+
+    Args:
+        subject_id: Stable id of the subject (e.g., person_id).
+        subject_type: 'Person' | 'Location' | 'Self' | ...
+        content: The fact text.
+        tags: Comma-separated tag list.
+        source: Where this fact came from ('manual', 'conversation', ...).
+        confidence: 0.0-1.0.
+    """
+    return RosBridge().remember(subject_id=subject_id, subject_type=subject_type,
+                                 content=content, tags=tags, source=source,
+                                 confidence=confidence)
+
+
+@mcp.tool()
+def recall(subject_id: str, subject_type: str = "Person",
+            query: str = "", limit: int = 10) -> dict:
+    """Retrieve facts about a subject, ranked by relevance to `query`."""
+    return RosBridge().recall(subject_id=subject_id, subject_type=subject_type,
+                               query=query, limit=limit)
+
+
+@mcp.tool()
+def relate_persons(a_id: str, b_id: str, relation: str,
+                    description: str = "",
+                    bidirectional: bool = False) -> dict:
+    """Add a relationship edge between two persons in the graph.
+
+    Args:
+        a_id, b_id: Person ids.
+        relation: Free-form label (e.g., 'parent_of', 'colleague_of').
+        description: Optional context.
+        bidirectional: If True, the relation applies in both directions.
+    """
+    return RosBridge().relate_persons(a_id=a_id, b_id=b_id, relation=relation,
+                                       description=description,
+                                       bidirectional=bidirectional)
+
+
+@mcp.tool()
+def find_related(subject_id: str, relation: str = "", hops: int = 1) -> dict:
+    """Walk the graph from `subject_id` following edges of type `relation`."""
+    return RosBridge().find_related(subject_id=subject_id,
+                                     relation=relation, hops=hops)
+
+
+@mcp.tool()
+def cypher(query: str, params: Optional[dict] = None) -> dict:
+    """Run a raw Cypher query against the knowledge graph.
+
+    Reserved for the memorist skill / advanced users. Most callers should
+    use `remember`, `recall`, `relate_persons`, `find_related` instead.
+    """
+    return RosBridge().cypher(query=query, params=params or {})
+
+
+# ============================================================
+# FastAPI app
+# ============================================================
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Eagerly initialize the rclpy node so the first MCP call doesn't pay
-    # the startup cost. Errors here are fatal — let systemd restart us.
     log.info("starting RosBridge")
     RosBridge()
     log.info("RosBridge ready")
@@ -69,9 +240,6 @@ def build_app() -> FastAPI:
         version="0.1.0",
         lifespan=lifespan,
     )
-
-    # Mount the MCP HTTP+SSE app under /mcp. Hermes config will point at
-    # http://127.0.0.1:8765/mcp/sse for the SSE stream.
     app.mount("/mcp", mcp.sse_app())
 
     @app.get("/healthz")
@@ -83,12 +251,9 @@ def build_app() -> FastAPI:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="ROS2 <-> Hermes MCP bridge daemon")
-    parser.add_argument("--host", default="127.0.0.1",
-                        help="Bind host (loopback only by default).")
-    parser.add_argument("--port", type=int, default=8765,
-                        help="Bind port (default 8765).")
-    parser.add_argument("--log-level", default="info",
-                        help="uvicorn log level: debug|info|warning|error")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--log-level", default="info")
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -96,8 +261,6 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    # Make SIGTERM (systemd) and SIGINT (terminal) hand off to uvicorn's
-    # signal handlers cleanly.
     def _handle_signal(signum, _frame):
         log.info("received signal %s, exiting", signum)
         sys.exit(0)
