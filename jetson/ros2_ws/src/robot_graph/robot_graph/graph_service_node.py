@@ -65,6 +65,12 @@ class GraphServiceNode(Node):
         self.declare_parameter('db_path', '')
         self.declare_parameter('voice_threshold', 0.65)
         self.declare_parameter('scene_threshold', 0.75)
+        # Auto-register every unrecognised voice as 'Unknown (timestamp)' Person?
+        # Default off — leaving this on combined with VAD-driven mic flapping
+        # and any speaker/echo bleed produces a flood of ghost rows. The
+        # register-person skill performs the explicit enrollment when the
+        # agent decides someone is worth remembering.
+        self.declare_parameter('auto_register_unknown_voice', False)
 
         db_path = self.get_parameter('db_path').value or None
         self.store = GraphStore(db_path=db_path)
@@ -73,6 +79,8 @@ class GraphServiceNode(Node):
         self.face_embedder = StubFaceEmbedder()
         self.voice_threshold = float(self.get_parameter('voice_threshold').value)
         self.scene_threshold = float(self.get_parameter('scene_threshold').value)
+        self.auto_register_unknown_voice = bool(
+            self.get_parameter('auto_register_unknown_voice').value)
 
         # Identity services
         self.create_service(IdentifyVoice,  '/identity/identify_voice', self.identify_voice)
@@ -124,12 +132,21 @@ class GraphServiceNode(Node):
         ident.fused_confidence = float(score)
         ident.stamp = self.get_clock().now().to_msg()
         if pid is None:
-            # Auto-register unknown
-            new_pid = self.store.upsert_person(None,
-                primary_name=f"Unknown ({self._short_now()})")
-            self.store.add_voice_sample(new_pid, emb, self.voice_embedder.name)
-            ident.person_id = new_pid
-            ident.primary_name = f"Unknown ({self._short_now()})"
+            # No match. Whether to persist as a fresh Person depends on the
+            # `auto_register_unknown_voice` param. Default off (see __init__
+            # for rationale). When off, we still return a transient identity
+            # — empty person_id signals "unknown speaker" to the caller.
+            if self.auto_register_unknown_voice:
+                new_pid = self.store.upsert_person(
+                    None,
+                    primary_name=f"Unknown ({self._short_now()})")
+                self.store.add_voice_sample(new_pid, emb,
+                                             self.voice_embedder.name)
+                ident.person_id = new_pid
+                ident.primary_name = f"Unknown ({self._short_now()})"
+            else:
+                ident.person_id = ''
+                ident.primary_name = ''
             ident.is_new = True
         else:
             ident.person_id = pid
