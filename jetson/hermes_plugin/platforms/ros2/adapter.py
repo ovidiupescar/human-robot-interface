@@ -283,14 +283,16 @@ class Ros2Adapter(BasePlatformAdapter):
             user_id=USER_ID,
             user_name="Physical World",
         )
-        metadata = {"augmentations": augmentations} if augmentations else None
+        # MessageEvent doesn't expose a metadata field; the closest typed slot
+        # is `raw_message` (Any). Stash augmentations there so downstream
+        # skills can pull them off without us inventing a new attribute.
         evt = MessageEvent(
             text=formatted_text,
             message_type=MessageType.TEXT,
             source=source,
             message_id=str(int(time.time() * 1000)),
             timestamp=_dt.datetime.now(),
-            metadata=metadata,
+            raw_message={"augmentations": augmentations} if augmentations else None,
         )
         asyncio.create_task(self.handle_message(evt))
 
