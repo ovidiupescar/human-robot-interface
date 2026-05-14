@@ -88,11 +88,23 @@ class _BridgeNode(Node):
     SERVICE_WAIT_S = 2.0       # how long to wait for a service to be available
     CALL_TIMEOUT_S = 10.0      # default service call timeout
 
+    # ---- wake-word gating ----
+    #
+    # The bus only forwards voice events to /events subscribers (== the
+    # Hermes platform adapter) when a wake word has fired within the last
+    # WAKE_WINDOW_S seconds. Without this gate, every ambient utterance
+    # the VAD picks up — including the robot's own TTS reverb — becomes a
+    # Hermes user message, which spirals into a self-reply loop.
+    WAKE_WINDOW_S = 12.0
+
     def __init__(self) -> None:
         super().__init__("robot_mcp_bridge")
 
         # Event bus for fanning perception updates out to WebSocket clients.
         self._bus = get_bus()
+
+        # Wake-word window — set by /perception/wake_word, cleared by timeout.
+        self._wake_until: float = 0.0
 
         # Publishers
         self._tts_pub = self.create_publisher(TtsRequest, "/tts/say", 10)
@@ -127,6 +139,8 @@ class _BridgeNode(Node):
 
         self.create_subscription(Bool, "/perception/voice_active",
                                  self._on_voice_active, 10)
+        self.create_subscription(String, "/perception/wake_word",
+                                 self._on_wake_word, 5)
         self.create_subscription(Float32, "/perception/addressee_score",
                                  self._on_addressee_score, 10)
         self.create_subscription(String, "/perception/addressee_hint",
@@ -157,11 +171,19 @@ class _BridgeNode(Node):
     # event onto the bus. The platform adapter listens on /events and turns
     # these into Hermes MessageEvent dispatches.
 
+    def _wake_active(self) -> bool:
+        return time.monotonic() < self._wake_until
+
     def _emit_voice(self, text: str, lang: str = "") -> None:
         if not text:
             return
         self._last_transcript = text
         self._transcript_event.set()
+        # Hard gate: only forward voice events to the platform adapter
+        # while a wake word is recent. Without this the robot replies to
+        # ambient noise (including its own TTS bleed) every utterance.
+        if not self._wake_active():
+            return
         event = {
             "type": "voice",
             "ts": _iso_now(),
@@ -201,9 +223,23 @@ class _BridgeNode(Node):
         self._language_source = msg.source or self._language_source
 
     def _on_voice_active(self, msg: Bool) -> None:
+        # Mirror the same wake-gating policy as voice events.
+        if not self._wake_active():
+            return
         self._bus.publish({
             "type": "voice_started" if msg.data else "voice_ended",
             "ts": _iso_now(),
+        })
+
+    def _on_wake_word(self, msg: String) -> None:
+        """Wake word detected. Open the listening window so the next
+        voice events are forwarded to Hermes."""
+        self._wake_until = time.monotonic() + self.WAKE_WINDOW_S
+        self._bus.publish({
+            "type": "wake_word",
+            "ts": _iso_now(),
+            "model": msg.data,
+            "window_s": self.WAKE_WINDOW_S,
         })
 
     def _on_addressee_score(self, msg: Float32) -> None:
