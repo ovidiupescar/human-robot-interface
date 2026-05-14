@@ -12,8 +12,8 @@ WS="$SCRIPT_DIR/../ros2_ws"
 source /opt/ros/humble/setup.bash
 source "$WS/install/setup.bash"
 
-# Adjust serial port + audio devices as needed
+# Adjust serial port + audio devices as needed. Empty overrides cannot be
+# passed via the CLI (ROS2 rejects `name:=` with no value); rely on the
+# launch file's defaults, set ENV vars to override if needed.
 exec ros2 launch robot_bringup robot.launch.py \
-    face_serial_port:=/dev/robot_face \
-    audio_input_device:="" \
-    audio_output_device:=""
+    face_serial_port:=/dev/robot_face
