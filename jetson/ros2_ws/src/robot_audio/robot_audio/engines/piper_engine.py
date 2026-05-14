@@ -5,12 +5,16 @@ Streams PCM16 mono chunks from a Piper voice (.onnx model).
 
 from __future__ import annotations
 
+import logging
 import os
 import threading
+import traceback
 from pathlib import Path
 from typing import Callable, Dict, Iterator, Optional
 
 import numpy as np
+
+_log = logging.getLogger(__name__)
 
 try:
     from piper import PiperVoice
@@ -89,7 +93,10 @@ class PiperEngine(Engine):
         try:
             with self._lock:
                 pv = self._load_voice(voice_id)
-        except Exception:
+        except Exception as exc:
+            _log.error('piper: failed to load voice %s: %s\n%s',
+                       voice_id, exc, traceback.format_exc())
+            print(f'[piper] load failed for {voice_id}: {exc}', flush=True)
             yield from silence_chunks(text, self.output_sample_rate,
                                        cancel=cancel)
             return
@@ -107,7 +114,11 @@ class PiperEngine(Engine):
                 # Resample path: buffer ~200ms of audio at native SR, then
                 # resample the batch once to avoid boundary artifacts.
                 yield from self._stream_with_resample(pv, text, cancel)
-        except Exception:
+        except Exception as exc:
+            _log.error('piper: synthesis failed: %s\n%s',
+                       exc, traceback.format_exc())
+            print(f'[piper] synthesis failed: {exc}\n{traceback.format_exc()}',
+                  flush=True)
             yield from silence_chunks(' ', self.output_sample_rate,
                                        cancel=cancel)
 
