@@ -1,0 +1,4 @@
+.pio/
+.vscode/
+.claude/
+jetson/memorist_dev/test.kuzu*

@@ -1,0 +1,7 @@
+# Identify speaker from raw audio sample.
+uint8[] audio_pcm_int16     # mono int16 little-endian
+uint32 sample_rate
+---
+PersonIdentity identity
+bool success
+string message

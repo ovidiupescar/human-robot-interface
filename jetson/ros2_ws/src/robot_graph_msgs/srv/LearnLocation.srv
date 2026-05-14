@@ -1,0 +1,9 @@
+# Bind a name to the current visual scene. Captures N frames over a short
+# window as samples for centroid stability.
+string name
+string parent_name          # optional, e.g. "home"
+uint16 sample_count         # default 5 if 0
+---
+LocationIdentity identity
+bool success
+string message

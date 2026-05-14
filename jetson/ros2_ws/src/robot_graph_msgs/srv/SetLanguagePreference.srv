@@ -1,0 +1,16 @@
+# Set a language preference at one of four scopes.
+#
+# scope = "default" : global default (writes Self.default_language)
+#         "person"  : per-person preference (writes Person.preferred_language)
+#         "location": per-location override (writes Location.language_override)
+#         "event"   : per-event override (writes Event.language_override)
+#
+# language = "ro" | "en" | "" (empty clears the preference at that scope)
+# scope_id is required for person/location/event scopes (ignored for default).
+
+string scope
+string scope_id
+string language
+---
+bool success
+string message

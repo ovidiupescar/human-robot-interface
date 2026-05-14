@@ -1,0 +1,16 @@
+name: ros2-perception
+label: ROS2
+kind: platform
+version: 0.1.0
+description: |
+  Pushes ROS2 perception events (voice activity, transcripts, vision events)
+  into a single persistent Hermes session ("robot-main") so the agent reacts
+  to the physical world the same way it reacts to Telegram messages.
+author: Ovidiu Pescar
+requires_env:
+  - name: ROS2_ROBOT_CHAT_ID
+    description: "Stable chat_id for the robot session"
+    default: "robot-main"
+  - name: ROS2_DOMAIN_ID
+    description: "ROS2 DDS domain id (must match nodes)"
+    default: "0"

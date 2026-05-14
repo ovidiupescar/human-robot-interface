@@ -1,0 +1,7 @@
+# Identify current location from visual scene.
+# Uses most recent camera frame if no image provided.
+uint8[] image_jpeg          # optional; empty = use latest frame
+---
+LocationIdentity identity
+bool success
+string message

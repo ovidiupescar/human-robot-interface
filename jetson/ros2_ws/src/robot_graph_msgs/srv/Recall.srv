@@ -1,0 +1,12 @@
+# Recall facts/episodes related to a subject.
+string subject_id           # Person/Location/Event id or name
+string subject_type         # "Person" | "Location" | "Event" | "Topic"
+string query                # optional semantic query; "" = recent-only
+uint16 limit                # max results, default 10 if 0
+string mode                 # "recent" | "tagged" | "semantic"; "" = auto
+---
+string[] fact_ids
+string[] contents
+float32[] scores            # match score per result
+bool success
+string message

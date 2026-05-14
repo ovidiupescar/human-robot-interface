@@ -1,0 +1,11 @@
+# Store a fact about a person/location/topic in the knowledge graph.
+string subject_id           # Person/Location/Event id
+string subject_type         # "Person" | "Location" | "Event" | "Topic"
+string content              # the fact text
+string tags                 # comma-separated
+string source               # "voice" | "manual" | "memorist" | "inferred"
+float32 confidence
+---
+string fact_id
+bool success
+string message

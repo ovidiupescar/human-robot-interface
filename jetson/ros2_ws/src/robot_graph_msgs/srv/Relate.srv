@@ -1,0 +1,10 @@
+# Create a typed edge between two persons (or other nodes).
+string subject_a_id
+string subject_b_id
+string subject_type         # "Person" by default; or "Location", "Event"
+string relation             # parent_of, sibling_of, friend_of, partner_of, knows, ...
+string description
+bool bidirectional
+---
+bool success
+string message

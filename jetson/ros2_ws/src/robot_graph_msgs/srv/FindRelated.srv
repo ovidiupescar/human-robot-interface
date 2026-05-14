@@ -1,0 +1,11 @@
+# Find nodes related to a given subject through a typed edge.
+string subject_id
+string subject_type         # "Person" | "Location" | "Event"
+string relation             # optional filter; "" = any
+uint16 hops                 # 1 = direct; 2 = 2-hop; capped at 3
+---
+string[] related_ids
+string[] related_names
+string[] relation_types     # the edge type along the path
+bool success
+string message

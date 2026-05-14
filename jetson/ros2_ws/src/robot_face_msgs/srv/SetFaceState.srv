@@ -1,0 +1,7 @@
+# Request: state + amplitude
+uint8 state
+float32 amplitude
+---
+# Response: ack
+bool success
+string message

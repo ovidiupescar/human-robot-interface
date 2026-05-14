@@ -1,0 +1,8 @@
+# Create an edge between two locations.
+string location_a_name
+string location_b_name
+string relation             # part_of, near, connects_to, ...
+string description
+---
+bool success
+string message

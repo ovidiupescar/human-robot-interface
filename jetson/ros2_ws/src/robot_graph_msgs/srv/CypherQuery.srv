@@ -1,0 +1,8 @@
+# Escape hatch: run arbitrary Cypher against the knowledge graph.
+# Powerful, dangerous; gate behind safety_monitor in production.
+string cypher
+string params_json          # JSON object of bind parameters
+---
+string result_json          # JSON-encoded result rows
+bool success
+string message

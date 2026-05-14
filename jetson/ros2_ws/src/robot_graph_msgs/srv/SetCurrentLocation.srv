@@ -1,0 +1,8 @@
+# Manually set current location (when vision isn't available or to override).
+# Creates the Location if name is new.
+string name
+string parent_name
+---
+LocationIdentity identity
+bool success
+string message

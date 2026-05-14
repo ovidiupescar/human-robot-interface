@@ -1,0 +1,5 @@
+# Right-to-be-forgotten: cascade delete person + samples + memories + edges.
+string person_id
+---
+bool success
+string message

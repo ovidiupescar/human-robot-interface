@@ -1,0 +1,8 @@
+# TTS speak request
+# Blocks until playback complete
+
+string text
+---
+bool success
+string message
+float32 duration_seconds

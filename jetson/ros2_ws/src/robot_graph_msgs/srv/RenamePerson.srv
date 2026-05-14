@@ -1,0 +1,7 @@
+string person_id
+string new_primary_name
+string[] add_aliases
+string[] remove_aliases
+---
+bool success
+string message
