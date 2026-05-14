@@ -22,7 +22,7 @@ import time
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Bool, UInt8MultiArray
+from std_msgs.msg import Bool, String, UInt8MultiArray
 
 from robot_perception_msgs.msg import Transcript
 
@@ -52,15 +52,54 @@ class SpeechRecognizer(Node):
         self.declare_parameter('allowed_languages', ['ro', 'en'])
         self.declare_parameter('default_language', 'ro')
         self.declare_parameter('sample_rate', 16000)
+        # Fragment filter: anything shorter than these gates does NOT
+        # publish a final transcript. Stops "Oh", "Bye", "Mm-hmm",
+        # whisper hallucinations on silence, and partial reverb-tail
+        # captures from being treated as a user utterance.
+        self.declare_parameter('min_final_words', 2)
+        self.declare_parameter('min_final_audio_s', 0.6)
+        self.declare_parameter(
+            'fragment_blacklist',
+            [
+                # Common whisper hallucinations on silence/reverb.
+                'thanks for watching',
+                'thanks for watching.',
+                'thank you',
+                'thank you.',
+                'thanks',
+                'thanks.',
+                'bye',
+                'bye.',
+                'oh',
+                'oh.',
+                'um',
+                'uh',
+                'mm',
+                'mm-hmm',
+                'mm-hmm.',
+            ],
+        )
 
         self.sr = int(self.get_parameter('sample_rate').value)
         self.allowed = list(self.get_parameter('allowed_languages').value)
         self.default_lang = self.get_parameter('default_language').value
+        self.min_final_words = int(self.get_parameter('min_final_words').value)
+        self.min_final_audio_s = float(
+            self.get_parameter('min_final_audio_s').value)
+        self.fragment_blacklist = {
+            s.strip().lower()
+            for s in self.get_parameter('fragment_blacklist').value
+        }
 
         self.create_subscription(UInt8MultiArray, '/audio/chunk',
                                   self._on_chunk, 50)
         self.create_subscription(Bool, '/perception/voice_active',
                                   self._on_voice, 10)
+        # Drop any in-flight buffer when TTS starts — otherwise a
+        # half-captured user utterance gets concatenated with bot audio
+        # leak-through and the final transcript reads as the bot's text.
+        self.create_subscription(String, '/audio/playback_status',
+                                  self._on_playback_status, 10)
         self._partial_pub = self.create_publisher(
             Transcript, '/perception/transcript_partial', 20)
         self._final_pub = self.create_publisher(
@@ -128,6 +167,19 @@ class SpeechRecognizer(Node):
             threading.Thread(target=self._final_transcribe,
                              args=(pcm,), daemon=True).start()
 
+    def _on_playback_status(self, msg: String):
+        """When TTS starts, drop any in-flight capture and stop the partial
+        worker. We do NOT finalize — anything we have so far is contaminated
+        by speaker bleed."""
+        if msg.data == 'started':
+            self._partial_stop.set()
+            with self._lock:
+                self._capturing = False
+                self._buf = bytearray()
+                self._last_partial_text = ''
+                self._detected_lang = ''
+                self._detected_conf = 0.0
+
     # ---- language clamping ----
 
     def _clamp_language(self, lang: str) -> str:
@@ -188,10 +240,32 @@ class SpeechRecognizer(Node):
                     self._detected_lang or self.default_lang,
                     self._detected_conf, is_final=False)
 
+    def _is_fragment(self, text: str, audio_s: float) -> bool:
+        """Should this finalized transcript be dropped as noise?
+
+        Reasons covered (lifted from Pipecat's 'Filter Incomplete User Turns'):
+          - utterance audio shorter than min_final_audio_s
+          - word count below min_final_words
+          - text matches a known whisper-on-silence hallucination
+            ('thanks for watching', 'bye', 'oh', …)
+        """
+        normalized = text.strip().lower().rstrip('.!?,;: ')
+        if not normalized:
+            return True
+        if audio_s < self.min_final_audio_s:
+            return True
+        if normalized in self.fragment_blacklist:
+            return True
+        words = [w for w in normalized.split() if w]
+        if len(words) < self.min_final_words:
+            return True
+        return False
+
     def _final_transcribe(self, pcm: bytes):
         try:
             audio = (np.frombuffer(pcm, dtype=np.int16)
                      .astype(np.float32) / 32768.0)
+            audio_s = len(audio) / float(self.sr)
             use_lang = self._detected_lang if self._detected_lang else None
             segments, info = self._model.transcribe(
                 audio, language=use_lang, beam_size=3)
@@ -200,10 +274,15 @@ class SpeechRecognizer(Node):
                     or self._clamp_language(getattr(info, 'language', '')))
             conf = (self._detected_conf
                     or float(getattr(info, 'language_probability', 0.0)))
-            if text:
-                self._publish_transcript(
-                    self._final_pub, text, lang, conf, is_final=True)
-                self.get_logger().info(f'final [{lang}]: {text}')
+            if not text:
+                return
+            if self._is_fragment(text, audio_s):
+                self.get_logger().debug(
+                    f'fragment dropped [{lang}, {audio_s:.2f}s]: {text!r}')
+                return
+            self._publish_transcript(
+                self._final_pub, text, lang, conf, is_final=True)
+            self.get_logger().info(f'final [{lang}]: {text}')
         except Exception as e:
             self.get_logger().error(f'final transcribe error: {e}')
 

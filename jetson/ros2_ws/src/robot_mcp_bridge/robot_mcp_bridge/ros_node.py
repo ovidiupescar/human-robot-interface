@@ -26,6 +26,28 @@ from robot_perception_msgs.msg import LanguagePreference, TtsRequest
 
 from .event_bus import get_bus
 
+# Wake acknowledgement: a short tone burst (PCM16 mono @ 22050 Hz). 880 Hz
+# for 120 ms with a small linear envelope. Kept inline so the daemon
+# doesn't ship asset files separately.
+def _wake_beep_pcm() -> bytes:
+    import math
+    import struct
+    sr = 22050
+    n = int(sr * 0.12)
+    fade = int(sr * 0.012)
+    samples = []
+    for i in range(n):
+        env = 1.0
+        if i < fade:
+            env = i / fade
+        elif i > n - fade:
+            env = (n - i) / fade
+        s = int(0.35 * env * 32767 * math.sin(2 * math.pi * 880 * i / sr))
+        samples.append(s)
+    return struct.pack('<' + 'h' * len(samples), *samples)
+
+_WAKE_BEEP_PCM = _wake_beep_pcm()
+
 # Try the typed transcript msg (bilingual builds); fall back to plain String.
 try:
     from robot_perception_msgs.msg import Transcript
@@ -97,6 +119,28 @@ class _BridgeNode(Node):
     # Hermes user message, which spirals into a self-reply loop.
     WAKE_WINDOW_S = 12.0
 
+    # Text wake fallback. STT sometimes catches "hey jarvis / hey robot"
+    # at the start of an utterance when the acoustic wake_word_node misses
+    # (accent, distance, model confidence < threshold). When that happens
+    # we open the wake window from the transcript side too. Leading punctuation
+    # and whitespace are stripped before the prefix check.
+    TEXT_WAKE_PHRASES = (
+        "hey jarvis",
+        "hey robot",
+        "hei jarvis",
+        "salut robotule",
+        "robot",
+    )
+
+    # ---- mic-mute strategy ----
+    #
+    # Even with audio_capture dropping chunks during playback, the
+    # speech_recognizer may have a transcript half-baked when TTS starts.
+    # As a third defence layer, the daemon also tracks /audio/playback_status
+    # and refuses to forward voice / wake events to /events for the duration
+    # of TTS playback + a hold-over tail.
+    BOT_SPEAKING_TAIL_S = 0.6
+
     def __init__(self) -> None:
         super().__init__("robot_mcp_bridge")
 
@@ -105,6 +149,9 @@ class _BridgeNode(Node):
 
         # Wake-word window — set by /perception/wake_word, cleared by timeout.
         self._wake_until: float = 0.0
+        # Bot-speaking suppression — set by /audio/playback_status callbacks.
+        self._bot_speaking: bool = False
+        self._bot_speaking_until: float = 0.0
 
         # Publishers
         self._tts_pub = self.create_publisher(TtsRequest, "/tts/say", 10)
@@ -150,6 +197,8 @@ class _BridgeNode(Node):
         self.create_subscription(UInt8MultiArray,
                                  "/vision/frame_at_utterance",
                                  self._on_frame, 5)
+        self.create_subscription(String, "/audio/playback_status",
+                                 self._on_playback_status, 10)
 
         # Graph service clients — created lazily when first needed.
         self._graph_clients: dict[str, Any] = {}
@@ -174,11 +223,57 @@ class _BridgeNode(Node):
     def _wake_active(self) -> bool:
         return time.monotonic() < self._wake_until
 
+    def _bot_is_speaking(self) -> bool:
+        return self._bot_speaking or time.monotonic() < self._bot_speaking_until
+
+    def _on_playback_status(self, msg: String) -> None:
+        status = msg.data
+        if status == "started":
+            self._bot_speaking = True
+        else:   # 'done' | 'interrupted' | anything else
+            self._bot_speaking = False
+            self._bot_speaking_until = (
+                time.monotonic() + self.BOT_SPEAKING_TAIL_S)
+
+    def _text_wake_match(self, text: str) -> Optional[str]:
+        """If `text` starts with a known wake phrase, return the matched
+        phrase; else return None. Strips leading punctuation/whitespace,
+        case-insensitive comparison.
+        """
+        if not text:
+            return None
+        s = text.lstrip().lstrip("!?.,:; ").lower()
+        for phrase in self.TEXT_WAKE_PHRASES:
+            if s.startswith(phrase):
+                # Require a word boundary after the phrase so 'robotic'
+                # doesn't match 'robot'.
+                tail = s[len(phrase):len(phrase) + 1]
+                if tail == "" or not tail.isalpha():
+                    return phrase
+        return None
+
     def _emit_voice(self, text: str, lang: str = "") -> None:
         if not text:
             return
         self._last_transcript = text
         self._transcript_event.set()
+
+        # Mic-mute gate (Pipecat-style AlwaysUserMuteStrategy): if the
+        # bot is currently speaking, treat any inbound transcript as
+        # leak-through and discard. Don't even check wake-word — a wake
+        # match while the bot is mid-sentence is almost certainly the
+        # bot's own audio bleed.
+        if self._bot_is_speaking():
+            return
+
+        # Belt-and-suspenders: if the acoustic wake_word_node missed but
+        # the transcript itself starts with a known wake phrase, open the
+        # window now.
+        matched_phrase = self._text_wake_match(text)
+        if matched_phrase is not None:
+            self._open_wake_window(source="transcript",
+                                     detail=matched_phrase)
+
         # Hard gate: only forward voice events to the platform adapter
         # while a wake word is recent. Without this the robot replies to
         # ambient noise (including its own TTS bleed) every utterance.
@@ -231,16 +326,39 @@ class _BridgeNode(Node):
             "ts": _iso_now(),
         })
 
-    def _on_wake_word(self, msg: String) -> None:
-        """Wake word detected. Open the listening window so the next
-        voice events are forwarded to Hermes."""
-        self._wake_until = time.monotonic() + self.WAKE_WINDOW_S
+    def _open_wake_window(self, *, source: str, detail: str = "") -> None:
+        """Open the listening window AND give the user an acknowledgement.
+
+        Called from both the acoustic wake handler and the transcript
+        wake fallback. Idempotent within the same window — back-to-back
+        wakes just refresh the deadline; the ack only fires when the
+        window transitions from closed → open.
+
+        Suppressed while the bot is speaking — a wake match heard while
+        TTS is playing is almost certainly the bot triggering itself.
+        """
+        if self._bot_is_speaking():
+            return
+
+        now = time.monotonic()
+        was_open = now < self._wake_until
+        self._wake_until = now + self.WAKE_WINDOW_S
         self._bus.publish({
             "type": "wake_word",
             "ts": _iso_now(),
-            "model": msg.data,
+            "source": source,         # 'acoustic' | 'transcript'
+            "model": detail,          # model id or matched phrase
             "window_s": self.WAKE_WINDOW_S,
         })
+        if not was_open:
+            try:
+                self.publish_wake_ack()
+            except Exception:
+                pass
+
+    def _on_wake_word(self, msg: String) -> None:
+        """Acoustic wake fired by wake_word_node (openWakeWord)."""
+        self._open_wake_window(source="acoustic", detail=msg.data)
 
     def _on_addressee_score(self, msg: Float32) -> None:
         self._last_addressee = float(msg.data)
@@ -317,6 +435,26 @@ class _BridgeNode(Node):
         msg.state = int(state)
         msg.amplitude = max(0.0, min(1.0, float(amplitude)))
         self._face_pub.publish(msg)
+
+    def publish_wake_ack(self) -> None:
+        """Tell the user we heard the wake word — face goes to PROCESSING
+        and a short tone plays through the existing /audio/playback pipe.
+        """
+        # Face cue (no-op if face hardware absent — face_bridge swallows
+        # disconnects gracefully and the rest of the system doesn't care).
+        self.publish_face(FaceCommand.STATE_PROCESSING, 0.6)
+
+        # Audio beep via the same UInt8MultiArray /audio/playback topic
+        # audio_player already subscribes to. Lazy-publisher creation so
+        # we don't carry the publisher cost when no acoustic ack is desired.
+        from array import array
+        from std_msgs.msg import UInt8MultiArray
+        if not hasattr(self, "_beep_pub") or self._beep_pub is None:
+            self._beep_pub = self.create_publisher(
+                UInt8MultiArray, "/audio/playback", 5)
+        msg = UInt8MultiArray()
+        msg.data = array('B', _WAKE_BEEP_PCM)
+        self._beep_pub.publish(msg)
 
     def call_speak(self, text: str, timeout: float | None = None) -> Optional[Any]:
         timeout = timeout or self.CALL_TIMEOUT_S
