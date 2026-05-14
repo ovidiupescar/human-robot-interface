@@ -1,6 +1,6 @@
 """Speech-to-Text via faster-whisper — streaming partials + final, with language detection.
 
-Subscribes:  /audio/chunk             (ByteMultiArray)  PCM16 mono @ sample_rate
+Subscribes:  /audio/chunk             (UInt8MultiArray)  PCM16 mono @ sample_rate
              /perception/voice_active (Bool)            gates capture window
 Publishes:   /perception/transcript_partial (Transcript)   streaming partials
              /perception/transcript         (Transcript)   final on EOS
@@ -22,7 +22,7 @@ import time
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Bool, ByteMultiArray
+from std_msgs.msg import Bool, UInt8MultiArray
 
 from robot_perception_msgs.msg import Transcript
 
@@ -57,7 +57,7 @@ class SpeechRecognizer(Node):
         self.allowed = list(self.get_parameter('allowed_languages').value)
         self.default_lang = self.get_parameter('default_language').value
 
-        self.create_subscription(ByteMultiArray, '/audio/chunk',
+        self.create_subscription(UInt8MultiArray, '/audio/chunk',
                                   self._on_chunk, 50)
         self.create_subscription(Bool, '/perception/voice_active',
                                   self._on_voice, 10)
@@ -93,7 +93,7 @@ class SpeechRecognizer(Node):
 
     # ---- audio ingestion ----
 
-    def _on_chunk(self, msg: ByteMultiArray):
+    def _on_chunk(self, msg: UInt8MultiArray):
         if not self._capturing:
             return
         with self._lock:

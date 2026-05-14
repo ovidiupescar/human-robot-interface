@@ -11,11 +11,11 @@ Rationale (from robo-brain v0.2):
     before the next utterance starts.
 
 Subscribes:
-    /camera/image_jpeg          (ByteMultiArray)  source frames at camera rate
+    /camera/image_jpeg          (UInt8MultiArray)  source frames at camera rate
     /perception/voice_active    (Bool)            VAD onset triggers capture
 
 Publishes:
-    /vision/frame_at_utterance  (ByteMultiArray)  the captured JPEG (latched-ish:
+    /vision/frame_at_utterance  (UInt8MultiArray)  the captured JPEG (latched-ish:
                                   republished if not consumed within TTL)
 
 Notes:
@@ -29,7 +29,7 @@ import time
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Bool, ByteMultiArray
+from std_msgs.msg import Bool, UInt8MultiArray
 
 
 class VisionCapture(Node):
@@ -41,12 +41,12 @@ class VisionCapture(Node):
         super().__init__('vision_capture')
         self.declare_parameter('publish_on_capture', True)
 
-        self.create_subscription(ByteMultiArray, '/camera/image_jpeg',
+        self.create_subscription(UInt8MultiArray, '/camera/image_jpeg',
                                  self._on_frame, 5)
         self.create_subscription(Bool, '/perception/voice_active',
                                  self._on_voice, 10)
         self._pub = self.create_publisher(
-            ByteMultiArray, '/vision/frame_at_utterance', 5)
+            UInt8MultiArray, '/vision/frame_at_utterance', 5)
 
         self._latest_frame: bytes | None = None
         self._latest_frame_t = 0.0
@@ -55,7 +55,7 @@ class VisionCapture(Node):
 
         self.get_logger().info('vision_capture ready')
 
-    def _on_frame(self, msg: ByteMultiArray):
+    def _on_frame(self, msg: UInt8MultiArray):
         with self._lock:
             self._latest_frame = bytes(msg.data)
             self._latest_frame_t = time.time()
@@ -79,8 +79,9 @@ class VisionCapture(Node):
                 f'VAD onset but latest frame too old ({frame_age:.1f}s)')
             return
 
-        out = ByteMultiArray()
-        out.data = list(frame)
+        from array import array
+        out = UInt8MultiArray()
+        out.data = array('B', frame)
         self._pub.publish(out)
         self.get_logger().info(
             f'frame captured ({len(frame)} bytes, age {frame_age*1000:.0f}ms)')

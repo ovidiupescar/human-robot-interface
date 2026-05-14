@@ -5,7 +5,7 @@ For now this is a stub that publishes "unknown" location at 0.1Hz so the rest
 of the pipeline works without a camera.
 
 Subscribes:
-    /camera/image_jpeg  (std_msgs/ByteMultiArray) — TODO when camera node wired
+    /camera/image_jpeg  (std_msgs/UInt8MultiArray) — TODO when camera node wired
 Publishes:
     /perception/current_location (LocationIdentity)
     /perception/scene_changed   (std_msgs/Bool)
@@ -29,7 +29,7 @@ class SceneRecognizer(Node):
         self._change_pub = self.create_publisher(Bool, '/perception/scene_changed', 10)
 
         # TODO: subscribe to /camera/image_jpeg when camera_driver is added.
-        # self.create_subscription(ByteMultiArray, '/camera/image_jpeg',
+        # self.create_subscription(UInt8MultiArray, '/camera/image_jpeg',
         #                          self._on_frame, 5)
 
         # For now: publish "unknown" every 10s so downstream knows we're alive.

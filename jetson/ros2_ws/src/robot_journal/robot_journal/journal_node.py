@@ -27,7 +27,7 @@ from pathlib import Path
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Bool, ByteMultiArray, Float32, String
+from std_msgs.msg import Bool, Float32, String
 
 from robot_face_msgs.msg import FaceCommand, FaceState
 from robot_graph_msgs.msg import (

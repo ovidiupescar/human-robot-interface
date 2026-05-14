@@ -1,6 +1,6 @@
 """Audio capture node.
 
-Publishes:  /audio/chunk (std_msgs/ByteMultiArray) — raw PCM frames
+Publishes:  /audio/chunk (std_msgs/UInt8MultiArray) — raw PCM frames
             /audio/level (std_msgs/Float32)        — RMS level for VAD/UI
 
 TODO: replace dummy sounddevice usage with proper audio_common_msgs/AudioData.
@@ -9,7 +9,7 @@ TODO: replace dummy sounddevice usage with proper audio_common_msgs/AudioData.
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import ByteMultiArray, Float32
+from std_msgs.msg import UInt8MultiArray, Float32
 
 try:
     import sounddevice as sd
@@ -29,7 +29,7 @@ class AudioCapture(Node):
         self.chunk_samples = int(self.sr * chunk_ms / 1000)
         device = self.get_parameter('device').value or None
 
-        self._chunk_pub = self.create_publisher(ByteMultiArray, '/audio/chunk', 50)
+        self._chunk_pub = self.create_publisher(UInt8MultiArray, '/audio/chunk', 50)
         self._level_pub = self.create_publisher(Float32, '/audio/level', 20)
 
         if sd is None:
@@ -51,12 +51,11 @@ class AudioCapture(Node):
         if status:
             self.get_logger().warning(str(status))
 
-        # Publish raw PCM. ROS2 ByteMultiArray.data requires a list/sequence
-        # where each element is a `bytes` object of length 1 (rosidl octet
-        # array binding). Build it once per chunk.
-        raw = indata.tobytes()
-        msg = ByteMultiArray()
-        msg.data = [bytes((b,)) for b in raw]
+        # Publish raw PCM via UInt8MultiArray; data accepts array.array('B', ...)
+        # directly. Subscribers reconstruct with bytes(msg.data).
+        from array import array
+        msg = UInt8MultiArray()
+        msg.data = array('B', indata.tobytes())
         self._chunk_pub.publish(msg)
 
         # Publish level (RMS, 0..1)

@@ -1,8 +1,8 @@
 """Audio player — streaming ring-buffer playback with barge-in.
 
 Topics:
-    /audio/stream        (ByteMultiArray)  PCM chunks from streaming TTS
-    /audio/playback      (ByteMultiArray)  legacy: full PCM clips
+    /audio/stream        (UInt8MultiArray)  PCM chunks from streaming TTS
+    /audio/playback      (UInt8MultiArray)  legacy: full PCM clips
     /control/interrupt   (Interrupt)       flush buffer immediately
 
 Two playback paths:
@@ -19,7 +19,7 @@ import threading
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import ByteMultiArray
+from std_msgs.msg import UInt8MultiArray
 
 from robot_control_msgs.msg import Interrupt
 
@@ -40,9 +40,9 @@ class AudioPlayer(Node):
         self.sr = int(self.get_parameter('sample_rate').value)
         self.device = self.get_parameter('device').value or None
 
-        self.create_subscription(ByteMultiArray, '/audio/stream',
+        self.create_subscription(UInt8MultiArray, '/audio/stream',
                                  self._on_stream_chunk, 100)
-        self.create_subscription(ByteMultiArray, '/audio/playback',
+        self.create_subscription(UInt8MultiArray, '/audio/playback',
                                  self._on_full_clip, 10)
         self.create_subscription(Interrupt, '/control/interrupt',
                                  self._on_interrupt, 10)
@@ -68,11 +68,11 @@ class AudioPlayer(Node):
 
     # ---- inputs ----
 
-    def _on_stream_chunk(self, msg: ByteMultiArray):
+    def _on_stream_chunk(self, msg: UInt8MultiArray):
         pcm = np.frombuffer(bytes(msg.data), dtype=np.int16)
         self._write_ring(pcm)
 
-    def _on_full_clip(self, msg: ByteMultiArray):
+    def _on_full_clip(self, msg: UInt8MultiArray):
         pcm = np.frombuffer(bytes(msg.data), dtype=np.int16)
         self._write_ring(pcm)
 

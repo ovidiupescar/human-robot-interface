@@ -9,7 +9,7 @@ Topics:
     /tts/say             (TtsRequest)     full sentence to speak
     /language/current    (LanguagePreference)  authoritative current language
     /control/interrupt   (Interrupt)      cancel synthesis immediately
-    /audio/stream        (ByteMultiArray) PCM chunks emitted to audio_player
+    /audio/stream        (UInt8MultiArray) PCM chunks emitted to audio_player
     /audio/playback_status (String)       "started" | "done" | "interrupted"
 
 Service:
@@ -40,7 +40,7 @@ import time
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import ByteMultiArray, String
+from std_msgs.msg import UInt8MultiArray, String
 
 from robot_control_msgs.msg import Interrupt
 from robot_face_msgs.msg import FaceCommand
@@ -86,7 +86,7 @@ class TtsService(Node):
             output_sample_rate=self.sr)
 
         # Publishers
-        self._stream_pub = self.create_publisher(ByteMultiArray,
+        self._stream_pub = self.create_publisher(UInt8MultiArray,
                                                   '/audio/stream', 10)
         self._status_pub = self.create_publisher(String,
                                                   '/audio/playback_status', 10)
@@ -272,9 +272,10 @@ class TtsService(Node):
             self._emit_chunk(bytes(buf))
 
     def _emit_chunk(self, pcm_bytes: bytes):
-        # ROS2 ByteMultiArray expects a sequence of length-1 `bytes` objects.
-        msg = ByteMultiArray()
-        msg.data = [bytes((b,)) for b in pcm_bytes]
+        # UInt8MultiArray.data accepts array.array('B', ...) directly.
+        from array import array
+        msg = UInt8MultiArray()
+        msg.data = array('B', pcm_bytes)
         self._stream_pub.publish(msg)
 
     def _emit_status(self, status: str):
