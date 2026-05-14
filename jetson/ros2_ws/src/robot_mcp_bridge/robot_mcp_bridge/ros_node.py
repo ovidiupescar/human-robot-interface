@@ -50,13 +50,10 @@ except ImportError:
 # used on the wire. Lives here so the tool layer doesn't depend on
 # robot_face_msgs directly.
 _FACE_STATE_NAMES = {
-    "standby":   FaceCommand.STATE_STANDBY,
-    "listening": FaceCommand.STATE_LISTENING,
-    "speaking":  FaceCommand.STATE_SPEAKING,
+    "standby":    FaceCommand.STATE_STANDBY,
     "processing": FaceCommand.STATE_PROCESSING,
-    "error":     FaceCommand.STATE_ERROR,
-    "happy":     FaceCommand.STATE_HAPPY,
-    "sad":       FaceCommand.STATE_SAD,
+    "speaking":   FaceCommand.STATE_SPEAKING,
+    "aggressive": FaceCommand.STATE_AGGRESSIVE,
 }
 
 

@@ -72,8 +72,8 @@ def set_face(state: str, amplitude: float = 0.0) -> dict:
     """Set the ESP32 face state.
 
     Args:
-        state: One of: standby, listening, speaking, processing, error, happy, sad.
-        amplitude: 0.0-1.0 — used by speaking/listening for mouth movement intensity.
+        state: One of: standby, processing, speaking, aggressive.
+        amplitude: 0.0-1.0 — currently only consumed by 'speaking' (mouth intensity).
 
     Returns:
         {"ok": bool, "state": str, "amplitude": float}
