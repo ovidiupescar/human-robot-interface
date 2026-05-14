@@ -266,11 +266,23 @@ class Ros2Adapter(BasePlatformAdapter):
             text, aug = _format_voice(ev)
             self._dispatch(text, augmentations=aug)
             return
-        # All non-voice events (voice_started, voice_ended, language_changed,
-        # context_warm, person_identified, location_changed) become META
-        # messages so they appear in the session timeline.
-        text = _format_meta(ev)
-        self._dispatch(text)
+        if typ == "wake_word":
+            # Wake events are an internal activation cue: they OPEN the
+            # daemon's window so the next 'voice' events get forwarded.
+            # They are NOT themselves user utterances — if we dispatch them
+            # into the Hermes session the agent will helpfully reply
+            # "I'm listening" to every wake, which then becomes a TTS turn
+            # the mic-duck won't fully absorb.
+            log.info("wake_word fired (model=%s, window=%.1fs)",
+                     ev.get("model"), ev.get("window_s", 0))
+            return
+        # The remaining events (voice_started, voice_ended,
+        # language_changed, person_identified, location_changed,
+        # context_warm) are silent in the session for now — they're useful
+        # diagnostics in the /events feed but the agent doesn't need to
+        # see them as user messages. Re-enable on a case-by-case basis if
+        # downstream skills want them.
+        return
 
     def _dispatch(self, formatted_text: str,
                    augmentations: Optional[Dict[str, Any]] = None) -> None:
