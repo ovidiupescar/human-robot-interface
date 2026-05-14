@@ -25,7 +25,11 @@ class WakeWord(Node):
     def __init__(self):
         super().__init__('wake_word')
         self.declare_parameter('model_name', 'hey_jarvis_v0.1')   # placeholder
-        self.declare_parameter('threshold', 0.6)
+        # 0.6 is the openWakeWord default but it misses softer/accented
+        # 'hey jarvis' on a Plantronics far-field puck. 0.4 catches more
+        # at the cost of a slightly higher false-positive rate (still
+        # bounded by the daemon's 12s post-wake window).
+        self.declare_parameter('threshold', 0.4)
         self.declare_parameter('sample_rate', 16000)
 
         self.threshold = float(self.get_parameter('threshold').value)
