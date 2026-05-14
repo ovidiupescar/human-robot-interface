@@ -231,10 +231,30 @@ async def lifespan(app: FastAPI):
     log.info("starting RosBridge")
     RosBridge()
     log.info("RosBridge ready")
+
+    # FastMCP's Streamable HTTP transport keeps a per-process task group
+    # of session workers. When the streamable_http_app is MOUNTED into a
+    # bigger ASGI app (FastAPI here), we have to start that task group
+    # ourselves; otherwise every POST to /mcp-http/mcp blows up with
+    # "Task group is not initialized. Make sure to use run()."
+    mcp_session_cm = None
+    if hasattr(mcp, "session_manager"):
+        try:
+            mcp_session_cm = mcp.session_manager.run()
+            await mcp_session_cm.__aenter__()
+            log.info("FastMCP Streamable HTTP session manager started")
+        except Exception as exc:
+            log.warning("FastMCP session manager unavailable: %s", exc)
+            mcp_session_cm = None
     try:
         yield
     finally:
         log.info("shutting down RosBridge")
+        if mcp_session_cm is not None:
+            try:
+                await mcp_session_cm.__aexit__(None, None, None)
+            except Exception:
+                pass
         RosBridge().shutdown()
 
 
