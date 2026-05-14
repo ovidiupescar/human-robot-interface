@@ -35,10 +35,14 @@ class AudioPlayer(Node):
 
     def __init__(self):
         super().__init__('audio_player')
-        self.declare_parameter('device', '')
+        # Default device = ALSA "default" PCM (driven by ~/.asoundrc), which
+        # uses the `plug` plugin to resample 22050Hz to whatever the physical
+        # device's native rate is. Opening hw:* directly fails with
+        # PaErrorCode -9997 on USB devices whose native rate is 48000Hz.
+        self.declare_parameter('device', 'default')
         self.declare_parameter('sample_rate', 22050)
         self.sr = int(self.get_parameter('sample_rate').value)
-        self.device = self.get_parameter('device').value or None
+        self.device = self.get_parameter('device').value or 'default'
 
         self.create_subscription(UInt8MultiArray, '/audio/stream',
                                  self._on_stream_chunk, 100)

@@ -20,14 +20,17 @@ except ImportError:
 class AudioCapture(Node):
     def __init__(self):
         super().__init__('audio_capture')
-        self.declare_parameter('device', '')           # ALSA device name; '' = default
+        # See audio_player_node for the rationale: 'default' goes through
+        # ALSA's plug plugin which resamples to the device's native rate.
+        # Opening hw:* directly fails with -9997 on USB devices.
+        self.declare_parameter('device', 'default')
         self.declare_parameter('sample_rate', 16000)
         self.declare_parameter('chunk_ms', 20)
 
         self.sr = int(self.get_parameter('sample_rate').value)
         chunk_ms = int(self.get_parameter('chunk_ms').value)
         self.chunk_samples = int(self.sr * chunk_ms / 1000)
-        device = self.get_parameter('device').value or None
+        device = self.get_parameter('device').value or 'default'
 
         self._chunk_pub = self.create_publisher(UInt8MultiArray, '/audio/chunk', 50)
         self._level_pub = self.create_publisher(Float32, '/audio/level', 20)
