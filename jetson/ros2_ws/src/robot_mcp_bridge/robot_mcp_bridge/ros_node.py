@@ -11,8 +11,10 @@ from __future__ import annotations
 import base64
 import datetime as _dt
 import json
+import os
 import threading
 import time
+from pathlib import Path
 from typing import Any, Optional
 
 import rclpy
@@ -86,6 +88,64 @@ except ImportError:
 def _iso_now() -> str:
     return _dt.datetime.now(_dt.timezone.utc).isoformat(
         timespec="milliseconds").replace("+00:00", "Z")
+
+
+# ============================================================
+# Chat log — human-readable line stream of WHAT was heard, said, and
+# called. Lives at ~/robot_data/chat.log by default. Independent of the
+# systemd journal (which is the firehose). Subscribers tail it via
+# `robot-logs` for an at-a-glance view of the conversation.
+# ============================================================
+
+
+class _ChatLog:
+    """Thread-safe append-only chat log."""
+
+    def __init__(self, path: Optional[Path] = None) -> None:
+        if path is None:
+            base = Path(os.environ.get("ROBOT_DATA_DIR",
+                                          str(Path.home() / "robot_data")))
+            path = base / "chat.log"
+        self._path = path
+        self._lock = threading.Lock()
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            # Touch the file so robot-logs has something to tail even
+            # before the first turn.
+            self._path.touch(exist_ok=True)
+        except Exception:
+            pass
+
+    def write(self, kind: str, text: str, **tags: Any) -> None:
+        """Append a single timestamped line.
+
+        Format: `HH:MM:SS  KIND  text  [tag=value tag=value …]`
+        Multi-line text is replaced with `↩ ` to keep one event per line.
+        """
+        clean = (text or "").replace("\n", " ↩ ").strip()
+        tag_str = ""
+        if tags:
+            tag_str = "  " + " ".join(f"{k}={v}" for k, v in tags.items()
+                                       if v is not None and v != "")
+        ts = _dt.datetime.now().strftime("%H:%M:%S")
+        line = f"{ts}  {kind:<5}  {clean}{tag_str}\n"
+        with self._lock:
+            try:
+                with open(self._path, "a", encoding="utf-8") as f:
+                    f.write(line)
+            except Exception:
+                pass
+
+
+# Singleton — RosBridge initializes it.
+_CHAT_LOG: Optional[_ChatLog] = None
+
+
+def chat_log() -> _ChatLog:
+    global _CHAT_LOG
+    if _CHAT_LOG is None:
+        _CHAT_LOG = _ChatLog()
+    return _CHAT_LOG
 
 
 # Map state names accepted by the face MCP tool to the integer constants
@@ -264,6 +324,8 @@ class _BridgeNode(Node):
         # match while the bot is mid-sentence is almost certainly the
         # bot's own audio bleed.
         if self._bot_is_speaking():
+            chat_log().write("USER", text, lang=lang or self._current_language,
+                              status="dropped:bot_speaking")
             return
 
         # Belt-and-suspenders: if the acoustic wake_word_node missed but
@@ -278,7 +340,11 @@ class _BridgeNode(Node):
         # while a wake word is recent. Without this the robot replies to
         # ambient noise (including its own TTS bleed) every utterance.
         if not self._wake_active():
+            chat_log().write("USER", text, lang=lang or self._current_language,
+                              status="dropped:no_wake")
             return
+
+        chat_log().write("USER", text, lang=lang or self._current_language)
         event = {
             "type": "voice",
             "ts": _iso_now(),
@@ -351,6 +417,7 @@ class _BridgeNode(Node):
             "window_s": self.WAKE_WINDOW_S,
         })
         if not was_open:
+            chat_log().write("WAKE", detail or "(wake)", source=source)
             try:
                 self.publish_wake_ack()
             except Exception:

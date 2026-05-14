@@ -26,9 +26,48 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from mcp.server.fastmcp import FastMCP
 
 from robot_mcp_bridge.event_bus import get_bus
-from robot_mcp_bridge.ros_node import RosBridge
+from robot_mcp_bridge.ros_node import RosBridge, chat_log
 
 log = logging.getLogger("robot_mcp_bridge")
+
+
+# Tool-call logging — every MCP tool invocation lands in the chat log so
+# the operator can see what Hermes is doing at a glance. Wraps the
+# original tool function via functools.wraps so FastMCP's introspection
+# still picks up the docstring and type hints.
+import functools as _functools
+
+
+def _logged_tool(fn):
+    @_functools.wraps(fn)
+    def wrapped(**kwargs):
+        # `speak` deserves its own line type so the chat reads naturally;
+        # everything else is TOOL.
+        if fn.__name__ in ("speak", "speak_sync"):
+            text = kwargs.get("text", "")
+            lang = kwargs.get("language", "")
+            chat_log().write("BOT", text, lang=lang,
+                              tool=fn.__name__)
+            return fn(**kwargs)
+        # Compact arg formatting: drop empty strings, truncate long values.
+        compact = {}
+        for k, v in kwargs.items():
+            if v in ("", None, [], {}):
+                continue
+            s = repr(v)
+            if len(s) > 80:
+                s = s[:77] + "..."
+            compact[k] = s
+        argstr = ", ".join(f"{k}={v}" for k, v in compact.items())
+        result = fn(**kwargs)
+        # Result preview: just the keys, or a one-line repr if small.
+        if isinstance(result, dict):
+            res_preview = "{" + ", ".join(result.keys()) + "}"
+        else:
+            res_preview = repr(result)[:60]
+        chat_log().write("TOOL", f"{fn.__name__}({argstr}) -> {res_preview}")
+        return result
+    return wrapped
 
 # ============================================================
 # MCP tool surface
@@ -46,6 +85,7 @@ mcp = FastMCP("robot")
 
 
 @mcp.tool()
+@_logged_tool
 def speak(text: str, language: str = "", voice: str = "") -> dict:
     """Speak `text` through the robot's TTS pipeline (fire-and-forget).
 
@@ -61,6 +101,7 @@ def speak(text: str, language: str = "", voice: str = "") -> dict:
 
 
 @mcp.tool()
+@_logged_tool
 def speak_sync(text: str, timeout_seconds: float = 30.0) -> dict:
     """Speak `text` and BLOCK until synthesis finishes.
 
@@ -72,6 +113,7 @@ def speak_sync(text: str, timeout_seconds: float = 30.0) -> dict:
 
 
 @mcp.tool()
+@_logged_tool
 def set_face(state: str, amplitude: float = 0.0) -> dict:
     """Set the ESP32 face state.
 
@@ -86,6 +128,7 @@ def set_face(state: str, amplitude: float = 0.0) -> dict:
 
 
 @mcp.tool()
+@_logged_tool
 def listen(timeout_seconds: float = 15.0) -> dict:
     """Wait for the next final transcript from the STT pipeline.
 
@@ -99,6 +142,7 @@ def listen(timeout_seconds: float = 15.0) -> dict:
 
 
 @mcp.tool()
+@_logged_tool
 def who_is_here() -> dict:
     """Return the most recently identified person, if any.
 
@@ -109,18 +153,21 @@ def who_is_here() -> dict:
 
 
 @mcp.tool()
+@_logged_tool
 def register_person(name: str) -> dict:
     """Enroll the currently speaking person under `name`."""
     return RosBridge().register_person(name=name)
 
 
 @mcp.tool()
+@_logged_tool
 def list_persons() -> dict:
     """List all known persons in the identity graph."""
     return RosBridge().list_persons()
 
 
 @mcp.tool()
+@_logged_tool
 def forget_person(person_id: str) -> dict:
     """Remove a person and their relations from the graph."""
     return RosBridge().forget_person(person_id=person_id)
@@ -130,6 +177,7 @@ def forget_person(person_id: str) -> dict:
 
 
 @mcp.tool()
+@_logged_tool
 def where_am_i() -> dict:
     """Return the current physical location of the robot.
 
@@ -140,18 +188,21 @@ def where_am_i() -> dict:
 
 
 @mcp.tool()
+@_logged_tool
 def learn_location(name: str, parent: str = "") -> dict:
     """Sample the current visual scene and bind it to a new named location."""
     return RosBridge().learn_location(name=name, parent=parent)
 
 
 @mcp.tool()
+@_logged_tool
 def set_current_location(name: str, parent: str = "") -> dict:
     """Manually set the robot's current location by name (overrides recognition)."""
     return RosBridge().set_current_location(name=name, parent=parent)
 
 
 @mcp.tool()
+@_logged_tool
 def list_locations() -> dict:
     """List all known locations in the graph."""
     return RosBridge().list_locations()
@@ -161,6 +212,7 @@ def list_locations() -> dict:
 
 
 @mcp.tool()
+@_logged_tool
 def remember(subject_id: str, subject_type: str, content: str,
               tags: str = "", source: str = "manual",
               confidence: float = 1.0) -> dict:
@@ -180,6 +232,7 @@ def remember(subject_id: str, subject_type: str, content: str,
 
 
 @mcp.tool()
+@_logged_tool
 def recall(subject_id: str, subject_type: str = "Person",
             query: str = "", limit: int = 10) -> dict:
     """Retrieve facts about a subject, ranked by relevance to `query`."""
@@ -188,6 +241,7 @@ def recall(subject_id: str, subject_type: str = "Person",
 
 
 @mcp.tool()
+@_logged_tool
 def relate_persons(a_id: str, b_id: str, relation: str,
                     description: str = "",
                     bidirectional: bool = False) -> dict:
@@ -205,6 +259,7 @@ def relate_persons(a_id: str, b_id: str, relation: str,
 
 
 @mcp.tool()
+@_logged_tool
 def find_related(subject_id: str, relation: str = "", hops: int = 1) -> dict:
     """Walk the graph from `subject_id` following edges of type `relation`."""
     return RosBridge().find_related(subject_id=subject_id,
@@ -212,6 +267,7 @@ def find_related(subject_id: str, relation: str = "", hops: int = 1) -> dict:
 
 
 @mcp.tool()
+@_logged_tool
 def cypher(query: str, params: Optional[dict] = None) -> dict:
     """Run a raw Cypher query against the knowledge graph.
 
