@@ -298,18 +298,70 @@ class Ros2Adapter(BasePlatformAdapter):
 
     # ---- outbound: MCP tool call over Streamable HTTP ----
     #
-    # We don't pull in the full MCP client SDK here; the only outbound
-    # operation we need is "call_tool('speak', ...)". A small raw POST
-    # using the Streamable HTTP transport's expected envelope works fine.
-    # If/when more tools are needed, swap this for `mcp.client` properly.
+    # Streamable HTTP requires an `initialize` exchange before tools/call
+    # is accepted; the server returns an Mcp-Session-Id header that must
+    # be sent on every subsequent request. We do it ourselves over httpx
+    # to keep the dependency surface minimal (no full mcp.client SDK).
 
     _next_id = 1
+    _session_id: Optional[str] = None
+    _session_lock: Optional[asyncio.Lock] = None
+
+    def _ensure_session_lock(self) -> asyncio.Lock:
+        if self._session_lock is None:
+            self._session_lock = asyncio.Lock()
+        return self._session_lock
+
+    async def _ensure_mcp_session(self) -> None:
+        async with self._ensure_session_lock():
+            if self._session_id is not None:
+                return
+            init = {
+                "jsonrpc": "2.0",
+                "id": self._next_id,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {},
+                    "clientInfo": {"name": "ros2-platform-adapter",
+                                    "version": "0.2.0"},
+                },
+            }
+            self._next_id += 1
+            headers = {
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/event-stream",
+            }
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.post(MCP_TTS_URL, json=init,
+                                           headers=headers)
+                resp.raise_for_status()
+                sid = (resp.headers.get("Mcp-Session-Id")
+                       or resp.headers.get("mcp-session-id"))
+                if sid:
+                    self._session_id = sid
+                # Fire the 'initialized' notification per spec.
+                notify = {
+                    "jsonrpc": "2.0",
+                    "method": "notifications/initialized",
+                    "params": {},
+                }
+                hdrs2 = dict(headers)
+                if sid:
+                    hdrs2["Mcp-Session-Id"] = sid
+                await client.post(MCP_TTS_URL, json=notify, headers=hdrs2)
 
     async def _call_mcp_tool(self, name: str, arguments: Dict[str, Any]
                               ) -> bool:
         if not HTTPX_AVAILABLE:
             log.error("httpx not installed in Hermes venv")
             return False
+        try:
+            await self._ensure_mcp_session()
+        except Exception as exc:
+            log.warning("MCP initialize failed: %s", exc)
+            return False
+
         payload = {
             "jsonrpc": "2.0",
             "id": self._next_id,
@@ -317,17 +369,22 @@ class Ros2Adapter(BasePlatformAdapter):
             "params": {"name": name, "arguments": arguments},
         }
         self._next_id += 1
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        }
+        if self._session_id:
+            headers["Mcp-Session-Id"] = self._session_id
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                resp = await client.post(
-                    MCP_TTS_URL,
-                    json=payload,
-                    headers={"Accept": "application/json, text/event-stream"},
-                )
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(MCP_TTS_URL, json=payload,
+                                           headers=headers)
                 resp.raise_for_status()
                 return True
         except Exception as exc:
             log.warning("MCP %s call failed: %s", name, exc)
+            # Forget the session so we'll re-initialize on retry.
+            self._session_id = None
             return False
 
     async def _call_speak_via_mcp(self, text: str, language: str = "") -> bool:
