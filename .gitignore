@@ -1,4 +1,7 @@
 .pio/
 .vscode/
 .claude/
-jetson/memorist_dev/test.kuzu*
+.env
+.env.*
+__pycache__/
+*.pyc
