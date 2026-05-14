@@ -339,10 +339,39 @@ class Ros2Adapter(BasePlatformAdapter):
 # ============================================================
 
 
+def _env_enablement() -> dict | None:
+    """Hermes-side enablement gate.
+
+    The robot is the only thing this Hermes ever talks to; we always want
+    the platform alive. Return a non-empty dict so the gateway treats the
+    platform as 'enabled' without requiring per-deployment env vars.
+    """
+    return {
+        "chat_id": CHAT_ID,
+        "events_url": EVENTS_URL,
+        "mcp_url": MCP_TTS_URL,
+    }
+
+
+def _check_requirements() -> bool:
+    """Adapter is healthy iff the websockets+httpx clients are importable.
+    The actual connectivity to ros2_bridge_daemon is exercised at connect()
+    time with a reconnect loop, so a temporarily-down daemon doesn't fail
+    plugin load.
+    """
+    return WEBSOCKETS_AVAILABLE and HTTPX_AVAILABLE
+
+
 def register(ctx):
     """Hermes plugin entry point. `ctx` is the platform-registration context."""
     ctx.register_platform(
         name="ros2",
         label="ROS2",
         adapter_factory=lambda config: Ros2Adapter(config),
+        check_fn=_check_requirements,
+        env_enablement_fn=_env_enablement,
+        install_hint=(
+            "pip install websockets httpx; ensure ros2_bridge_daemon is "
+            "running on http://127.0.0.1:8765"
+        ),
     )
