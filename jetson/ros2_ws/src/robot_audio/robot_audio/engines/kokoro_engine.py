@@ -83,14 +83,20 @@ class KokoroEngine(Engine):
         try:
             with self._lock:
                 self._ensure_loaded()
-        except Exception:
+        except Exception as exc:
+            import traceback as _tb
+            print(f'[kokoro] load failed: {exc}\n{_tb.format_exc()}',
+                  flush=True)
             yield from silence_chunks(text, self.output_sample_rate,
                                        cancel=cancel)
             return
 
         try:
             audio = self._synth_full(text, voice_id)
-        except Exception:
+        except Exception as exc:
+            import traceback as _tb
+            print(f'[kokoro] synthesis failed: {exc}\n{_tb.format_exc()}',
+                  flush=True)
             yield from silence_chunks(' ', self.output_sample_rate,
                                        cancel=cancel)
             return
