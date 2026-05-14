@@ -106,10 +106,12 @@ class PiperEngine(Engine):
         try:
             if not needs_resample:
                 # Fast path: Piper native SR matches pipeline SR. Pass through.
-                for audio_chunk in pv.synthesize_stream_raw(text):
+                # piper-tts 1.3+ yields AudioChunk objects from .synthesize();
+                # raw PCM16 bytes live on .audio_int16_bytes.
+                for chunk in pv.synthesize(text):
                     if cancel():
                         return
-                    yield audio_chunk
+                    yield chunk.audio_int16_bytes
             else:
                 # Resample path: buffer ~200ms of audio at native SR, then
                 # resample the batch once to avoid boundary artifacts.
@@ -132,10 +134,10 @@ class PiperEngine(Engine):
         flush_size = int(self.target_sample_rate
                           * _RESAMPLE_BUFFER_MS / 1000) * 2  # int16
 
-        for audio_chunk in pv.synthesize_stream_raw(text):
+        for chunk in pv.synthesize(text):
             if cancel():
                 return
-            buffer_bytes.extend(audio_chunk)
+            buffer_bytes.extend(chunk.audio_int16_bytes)
             while len(buffer_bytes) >= flush_size:
                 batch = bytes(buffer_bytes[:flush_size])
                 del buffer_bytes[:flush_size]
