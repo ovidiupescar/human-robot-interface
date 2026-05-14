@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Launch the full robot ROS2 stack.
 
-set -euo pipefail
+# NOTE: do NOT use `set -u` here — ROS2's /opt/ros/humble/setup.bash
+# (and the workspace install/setup.bash) reference unset variables
+# such as AMENT_TRACE_SETUP_FILES; nounset crashes the launch.
+set -eo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WS="$SCRIPT_DIR/../ros2_ws"
