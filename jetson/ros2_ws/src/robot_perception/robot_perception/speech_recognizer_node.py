@@ -56,8 +56,8 @@ class SpeechRecognizer(Node):
         # publish a final transcript. Stops "Oh", "Bye", "Mm-hmm",
         # whisper hallucinations on silence, and partial reverb-tail
         # captures from being treated as a user utterance.
-        self.declare_parameter('min_final_words', 2)
-        self.declare_parameter('min_final_audio_s', 0.6)
+        self.declare_parameter('min_final_words', 1)
+        self.declare_parameter('min_final_audio_s', 0.4)
         self.declare_parameter(
             'fragment_blacklist',
             [
@@ -275,9 +275,11 @@ class SpeechRecognizer(Node):
             conf = (self._detected_conf
                     or float(getattr(info, 'language_probability', 0.0)))
             if not text:
+                self.get_logger().info(
+                    f'whisper empty result [{audio_s:.2f}s of audio]')
                 return
             if self._is_fragment(text, audio_s):
-                self.get_logger().debug(
+                self.get_logger().info(
                     f'fragment dropped [{lang}, {audio_s:.2f}s]: {text!r}')
                 return
             self._publish_transcript(
