@@ -339,6 +339,19 @@ class _BridgeNode(Node):
         if matched_phrase is not None:
             self._open_wake_window(source="transcript",
                                      detail=matched_phrase)
+            # Suppress wake-only utterances. When the user says just "Hey
+            # Jarvis." and pauses, we should open the window but NOT also
+            # dispatch the wake phrase as a chat message — otherwise
+            # Hermes starts replying to "Hey Jarvis." and the user's
+            # follow-up arrives mid-reply, triggering an interrupt.
+            stripped_tail = (text.lstrip().lstrip("!?.,:; ")
+                              [len(matched_phrase):]
+                              .strip(" .!?,;:"))
+            if not stripped_tail:
+                chat_log().write("USER", text,
+                                  lang=lang or self._current_language,
+                                  status="wake_only")
+                return
 
         # Hard gate: only forward voice events to the platform adapter
         # while a wake word is recent. Without this the robot replies to
