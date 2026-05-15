@@ -34,10 +34,45 @@ Streaming model:
 Replace _synthesize_stream() with real Piper + Kokoro streaming when wiring.
 """
 
+import re
 import threading
 import time
 
 import numpy as np
+
+
+# Sentence splitter for TTS latency reduction. Engines like Kokoro
+# synthesize the FULL input text in a single blocking call before
+# yielding any audio, so a 12-second reply takes 3-5 seconds of
+# silence before the first phoneme reaches the speaker. Splitting
+# the text into sentences here lets the engine return the first
+# sentence's audio in ~0.5 s, audio_player starts playing it
+# immediately, and subsequent sentences synthesize while the user
+# is listening to the previous one.
+#
+# Match against the END of a sentence-like span, including the
+# terminator (.!?) and any trailing quotes. Newlines split too.
+_SENTENCE_BOUNDARY_RE = re.compile(r'(?<=[.!?])\s+|\n+')
+
+
+def _split_into_sentences(text: str, min_len: int = 12) -> list[str]:
+    """Split text into utterance-sized chunks for streaming synthesis.
+
+    `min_len` avoids creating tiny fragments — short single-word
+    sentences ('OK.', 'No.') get merged into the next one so the
+    engine isn't called on 4-character inputs.
+    """
+    if not text or not text.strip():
+        return []
+    parts = [p.strip() for p in _SENTENCE_BOUNDARY_RE.split(text)
+             if p and p.strip()]
+    merged: list[str] = []
+    for p in parts:
+        if merged and len(merged[-1]) < min_len:
+            merged[-1] = f'{merged[-1]} {p}'
+        else:
+            merged.append(p)
+    return merged or [text.strip()]
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import UInt8MultiArray, String
@@ -244,35 +279,41 @@ class TtsService(Node):
         self.sr before yielding (Piper 22050 -> sr, Kokoro 24000 -> sr).
         The pipeline downstream sees a single rate and the player needs no
         per-stream re-init.
+
+        Latency strategy: split the request text into sentences and call
+        the engine once per sentence. The first sentence's audio reaches
+        the speaker in ~0.5 s; subsequent sentences synthesize while the
+        user is already listening, hiding the per-sentence synth cost.
         """
         text = req.text
         lang = self._resolve_language(req)
         voice = self._resolve_voice(req, lang)
         engine = self._pick_engine(lang, voice)
 
+        sentences = _split_into_sentences(text)
         self.get_logger().debug(
             f'synth [{lang}/{voice}] via {engine.name} '
-            f'@ {engine.output_sample_rate}Hz: {text[:60]}...')
+            f'@ {engine.output_sample_rate}Hz: '
+            f'{len(sentences)} sentence(s), first={sentences[0][:60]!r}')
 
-        # Re-slice at the pipeline rate (= engine.output_sample_rate = self.sr)
         target_chunk_bytes = int(engine.output_sample_rate
                                   * self.CHUNK_MS / 1000) * 2  # int16
-
         cancel_cb = self._cancel.is_set
         buf = bytearray()
-        for chunk in engine.synthesize_stream(text, voice=voice,
-                                                cancel=cancel_cb):
+        for sentence in sentences:
             if self._cancel.is_set():
                 return
-            buf.extend(chunk)
-            # Re-slice into ~CHUNK_MS chunks
-            while len(buf) >= target_chunk_bytes:
+            for chunk in engine.synthesize_stream(sentence, voice=voice,
+                                                    cancel=cancel_cb):
                 if self._cancel.is_set():
                     return
-                slice_ = bytes(buf[:target_chunk_bytes])
-                del buf[:target_chunk_bytes]
-                self._emit_chunk(slice_)
-        # Flush remainder
+                buf.extend(chunk)
+                while len(buf) >= target_chunk_bytes:
+                    if self._cancel.is_set():
+                        return
+                    slice_ = bytes(buf[:target_chunk_bytes])
+                    del buf[:target_chunk_bytes]
+                    self._emit_chunk(slice_)
         if buf and not self._cancel.is_set():
             self._emit_chunk(bytes(buf))
 
