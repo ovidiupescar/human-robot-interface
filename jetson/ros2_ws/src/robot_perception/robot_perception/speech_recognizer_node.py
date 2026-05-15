@@ -46,11 +46,14 @@ class SpeechRecognizer(Node):
         # ~20s per 1s of audio with the 'medium' model; the from-source
         # CUDA build drops that to under 1s). 'small' with int8_float16
         # is the sweet spot of accuracy vs latency on Orin.
-        self.declare_parameter('model_size', 'small')
+        self.declare_parameter('model_size', 'small.en')
         self.declare_parameter('device', 'cuda')
         self.declare_parameter('compute_type', 'int8_float16')
-        self.declare_parameter('allowed_languages', ['ro', 'en'])
-        self.declare_parameter('default_language', 'ro')
+        # English-only mode: Romanian integration deferred. small.en is
+        # noticeably more accurate than the multilingual small and skips
+        # the language-detection pass entirely.
+        self.declare_parameter('allowed_languages', ['en'])
+        self.declare_parameter('default_language', 'en')
         self.declare_parameter('sample_rate', 16000)
         # Fragment filter: anything shorter than these gates does NOT
         # publish a final transcript. Stops "Oh", "Bye", "Mm-hmm",
