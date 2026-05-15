@@ -47,6 +47,31 @@ _HALLUCINATION_REPEAT_RE = re.compile(
 )
 
 
+def _has_repeated_phrase(text: str, min_words: int = 3,
+                          min_repeats: int = 2) -> bool:
+    """Detect whisper's "I'm going to add a little bit of salt to it.
+    I'm going to add a little bit of salt." failure mode.
+
+    Whisper, given non-speech audio (TTS bleed, HVAC, ambient hum),
+    will sometimes lock onto a phrase and emit it twice or three times.
+    The earlier regex only matched short tokens; this catches the
+    multi-word case. We strip punctuation, then check whether any
+    contiguous window of `min_words` consecutive words appears at
+    least `min_repeats` times in the transcript.
+    """
+    cleaned = re.sub(r'[^\w\s\']', ' ', text.lower())
+    words = [w for w in cleaned.split() if w]
+    if len(words) < min_words * min_repeats:
+        return False
+    seen: dict[str, int] = {}
+    for i in range(len(words) - min_words + 1):
+        gram = ' '.join(words[i:i + min_words])
+        seen[gram] = seen.get(gram, 0) + 1
+        if seen[gram] >= min_repeats:
+            return True
+    return False
+
+
 def _is_whisper_hallucination(text: str) -> bool:
     cleaned = text.strip().lower().rstrip('.!?')
     if not cleaned:
@@ -54,6 +79,8 @@ def _is_whisper_hallucination(text: str) -> bool:
     if cleaned in _WHISPER_HALLUCINATIONS:
         return True
     if _HALLUCINATION_REPEAT_RE.match(cleaned):
+        return True
+    if _has_repeated_phrase(text):
         return True
     return False
 
@@ -366,8 +393,23 @@ class SpeechRecognizer(Node):
             self.get_logger().info(
                 f'whisper transcribe start [{audio_s:.2f}s]')
             with self._whisper_lock:
+                # vad_filter: run Silero VAD first to drop silent regions
+                #   so whisper never decodes them as hallucinated text.
+                # no_repeat_ngram_size: forbid the decoder from emitting
+                #   the same trigram twice in a row, which kills the
+                #   "I'm going to add a little bit of salt. I'm going to
+                #   add a little bit of salt." failure mode at the source.
+                # hallucination_silence_threshold: when silence is detected
+                #   between segments, skip it instead of letting whisper
+                #   fill it with hallucinated text.
+                # condition_on_previous_text: off so a noisy first pass
+                #   doesn't poison subsequent segments in the same call.
                 segments, info = self._model.transcribe(
-                    audio, language=use_lang, beam_size=3)
+                    audio, language=use_lang, beam_size=3,
+                    vad_filter=True,
+                    no_repeat_ngram_size=3,
+                    hallucination_silence_threshold=0.5,
+                    condition_on_previous_text=False)
                 text = ' '.join(s.text.strip() for s in segments).strip()
             self.get_logger().info(
                 f'whisper transcribe done [{audio_s:.2f}s]: {text!r}')
