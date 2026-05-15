@@ -189,8 +189,10 @@ class RealtimeBridge(Node):
             try:
                 self._loop.run_until_complete(self._ws_session())
             except Exception as exc:
+                # Strip the API key from any exception text before logging.
+                msg = str(exc).replace(self.api_key, "<KEY>")
                 self.get_logger().error(
-                    f"realtime session crashed: {exc}; reconnecting in 5s")
+                    f"realtime session crashed: {msg}; reconnecting in 5s")
                 time.sleep(5)
 
     async def _ws_session(self) -> None:
@@ -483,19 +485,31 @@ _BUILTIN_TOOL_DECLARATIONS = [
 
 def _resolve_api_key(param_value: str) -> str:
     if param_value:
-        return param_value
+        return param_value.strip()
     env = os.environ.get("GEMINI_API_KEY", "")
     if env:
-        return env
-    # Fall back to ~/.hermes/.env (a flat KEY=VALUE file)
+        return env.strip()
+    # Fall back to ~/.hermes/.env (a flat KEY=VALUE file with optional
+    # '# trailing comments' that dotenv-style parsers strip).
     try:
         env_path = os.path.expanduser("~/.hermes/.env")
         if os.path.isfile(env_path):
             with open(env_path, "r") as fh:
                 for line in fh:
-                    line = line.strip()
-                    if line.startswith("GEMINI_API_KEY="):
-                        return line.split("=", 1)[1].strip().strip('"')
+                    raw = line.strip()
+                    if not raw.startswith("GEMINI_API_KEY="):
+                        continue
+                    value = raw.split("=", 1)[1]
+                    # Strip an inline comment, but only if it sits
+                    # OUTSIDE of any quotes. Keep it simple: if the
+                    # value isn't quoted, '#' starts a comment.
+                    value = value.strip()
+                    if value.startswith('"') and value.count('"') >= 2:
+                        # quoted: take what's inside the first pair
+                        return value.split('"', 2)[1]
+                    if "#" in value:
+                        value = value.split("#", 1)[0]
+                    return value.strip().strip('"').strip("'")
     except Exception:
         pass
     return ""
