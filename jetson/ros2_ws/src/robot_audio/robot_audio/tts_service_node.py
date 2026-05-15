@@ -324,6 +324,24 @@ class TtsService(Node):
         msg.data = array('B', pcm_bytes)
         self._stream_pub.publish(msg)
 
+        # Drive the face *every chunk* with an amplitude derived from
+        # the chunk's RMS level. Two reasons:
+        #   1. Lip-sync: the mouth opens/closes with the audio waveform
+        #      instead of being held at a constant 0.6.
+        #   2. Conflict override: Hermes Agent's send_typing heartbeat
+        #      sets face -> PROCESSING every ~2 s while the LLM is mid-
+        #      reply (which is also when TTS is playing). Re-asserting
+        #      SPEAKING at chunk cadence keeps the face in the right
+        #      state instead of flipping back to PROCESSING.
+        if self.drive_face and pcm_bytes:
+            pcm = np.frombuffer(pcm_bytes, dtype=np.int16)
+            rms = float(np.sqrt(np.mean(pcm.astype(np.float32) ** 2)))
+            # Normalize: int16 RMS ~ 0..32767. Typical speech ~ 2000-8000.
+            # Map to [0.1, 1.0] so the mouth always shows *some* motion
+            # during voiced segments but reacts to dynamics.
+            amp = min(1.0, max(0.1, rms / 8000.0))
+            self._set_face(FaceCommand.STATE_SPEAKING, amp)
+
     def _emit_status(self, status: str):
         m = String()
         m.data = status
