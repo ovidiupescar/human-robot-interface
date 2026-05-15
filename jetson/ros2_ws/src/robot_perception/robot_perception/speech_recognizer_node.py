@@ -108,12 +108,24 @@ class SpeechRecognizer(Node):
         self._buf = bytearray()
         self._capturing = False
         self._lock = threading.Lock()
+        # ctranslate2 is NOT safe to call concurrently. Serialize ALL
+        # whisper transcribe calls (final and partial) through one lock,
+        # otherwise concurrent calls hang silently on CPU-only builds.
+        self._whisper_lock = threading.Lock()
 
         self._partial_thread: threading.Thread | None = None
         self._partial_stop = threading.Event()
         self._last_partial_text = ''
         self._detected_lang = ''       # latest detected for this utterance
         self._detected_conf = 0.0
+
+        # Partial decoding is expensive on Jetson CPU (medium int8 ~= 1.5s
+        # per call). It also competes with final transcribe for the same
+        # CPU, starving the final pass. Off by default; enable via param
+        # when the model is small enough to keep up.
+        self.declare_parameter('enable_partials', False)
+        self._partials_enabled = bool(
+            self.get_parameter('enable_partials').value)
 
         self._model = None
         if WhisperModel is not None:
@@ -152,7 +164,7 @@ class SpeechRecognizer(Node):
             self._detected_lang = ''
             self._detected_conf = 0.0
         self._partial_stop.clear()
-        if self._model is not None:
+        if self._model is not None and self._partials_enabled:
             self._partial_thread = threading.Thread(
                 target=self._partial_loop, daemon=True)
             self._partial_thread.start()
@@ -218,10 +230,11 @@ class SpeechRecognizer(Node):
                          .astype(np.float32) / 32768.0)
                 # Pass language=None for first detection, then lock in
                 use_lang = self._detected_lang if self._detected_lang else None
-                segments, info = self._model.transcribe(
-                    audio, language=use_lang, beam_size=1,
-                    condition_on_previous_text=False)
-                text = ' '.join(s.text.strip() for s in segments).strip()
+                with self._whisper_lock:
+                    segments, info = self._model.transcribe(
+                        audio, language=use_lang, beam_size=1,
+                        condition_on_previous_text=False)
+                    text = ' '.join(s.text.strip() for s in segments).strip()
                 # Update detected language if not locked yet and audio long enough
                 if (not self._detected_lang
                         and audio_s >= self.LANG_DETECT_AUDIO_S
@@ -271,9 +284,14 @@ class SpeechRecognizer(Node):
                      .astype(np.float32) / 32768.0)
             audio_s = len(audio) / float(self.sr)
             use_lang = self._detected_lang if self._detected_lang else None
-            segments, info = self._model.transcribe(
-                audio, language=use_lang, beam_size=3)
-            text = ' '.join(s.text.strip() for s in segments).strip()
+            self.get_logger().info(
+                f'whisper transcribe start [{audio_s:.2f}s]')
+            with self._whisper_lock:
+                segments, info = self._model.transcribe(
+                    audio, language=use_lang, beam_size=3)
+                text = ' '.join(s.text.strip() for s in segments).strip()
+            self.get_logger().info(
+                f'whisper transcribe done [{audio_s:.2f}s]: {text!r}')
             lang = (self._detected_lang
                     or self._clamp_language(getattr(info, 'language', '')))
             conf = (self._detected_conf
