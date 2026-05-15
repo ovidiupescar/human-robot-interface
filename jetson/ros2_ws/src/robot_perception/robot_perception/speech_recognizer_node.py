@@ -163,6 +163,17 @@ class SpeechRecognizer(Node):
         self._partials_enabled = bool(
             self.get_parameter('enable_partials').value)
 
+        # Pre-roll buffer: keep the last N seconds of audio ALWAYS, so when
+        # voice_active goes True we can prepend it to recover the leading
+        # ~300ms that the 2-stage VAD swallows during speech confirmation.
+        # Without this, an utterance like "what is the database" reaches
+        # whisper as just "database" because the VAD took 300ms to confirm
+        # speech and speech_recognizer only buffered from that point on.
+        self.declare_parameter('preroll_seconds', 0.5)
+        self._preroll_s = float(self.get_parameter('preroll_seconds').value)
+        self._preroll_max_bytes = int(self._preroll_s * self.sr * 2)
+        self._preroll: bytearray = bytearray()
+
         self._model = None
         if WhisperModel is not None:
             model_size = self.get_parameter('model_size').value
@@ -193,10 +204,19 @@ class SpeechRecognizer(Node):
     # ---- audio ingestion ----
 
     def _on_chunk(self, msg: UInt8MultiArray):
-        if not self._capturing:
-            return
+        data = bytes(msg.data)
         with self._lock:
-            self._buf.extend(bytes(msg.data))
+            if self._capturing:
+                self._buf.extend(data)
+            else:
+                # Always maintain the pre-roll ring buffer. When the VAD
+                # finally fires voice_active=True, _start_capture seeds
+                # _buf with this so the first ~300ms of speech (lost to
+                # VAD confirmation latency) is recovered.
+                self._preroll.extend(data)
+                if len(self._preroll) > self._preroll_max_bytes:
+                    overflow = len(self._preroll) - self._preroll_max_bytes
+                    del self._preroll[:overflow]
 
     def _on_voice(self, msg: Bool):
         if msg.data and not self._capturing:
@@ -206,7 +226,12 @@ class SpeechRecognizer(Node):
 
     def _start_capture(self):
         with self._lock:
-            self._buf = bytearray()
+            # Seed the recording buffer with the pre-roll so the first
+            # ~300ms of speech that arrived before voice_active=True is
+            # not lost. Clear the pre-roll itself — it gets refilled
+            # while _capturing is False.
+            self._buf = bytearray(self._preroll)
+            self._preroll = bytearray()
             self._capturing = True
             self._last_partial_text = ''
             self._detected_lang = ''
@@ -240,6 +265,9 @@ class SpeechRecognizer(Node):
             with self._lock:
                 self._capturing = False
                 self._buf = bytearray()
+                # Also dump the pre-roll: any TTS audio it contains
+                # would otherwise be seeded into the next utterance.
+                self._preroll = bytearray()
                 self._last_partial_text = ''
                 self._detected_lang = ''
                 self._detected_conf = 0.0
