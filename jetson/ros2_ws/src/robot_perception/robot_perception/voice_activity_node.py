@@ -16,7 +16,12 @@ class VoiceActivity(Node):
     def __init__(self):
         super().__init__('voice_activity')
         self.declare_parameter('threshold_rms', 0.03)
-        self.declare_parameter('hangover_ms', 400)
+        # Hangover at 400ms splits natural utterances on every comma-pause;
+        # whisper then transcribes each fragment separately and Hermes
+        # ping-pongs between them, interrupting itself. 900ms coalesces
+        # the typical "what... is your name" into one transcript while
+        # still ending fast enough for back-and-forth conversation.
+        self.declare_parameter('hangover_ms', 900)
         self.threshold = float(self.get_parameter('threshold_rms').value)
         self.hangover_ms = int(self.get_parameter('hangover_ms').value)
 

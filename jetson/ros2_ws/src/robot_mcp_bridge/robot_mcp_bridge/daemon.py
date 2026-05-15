@@ -36,6 +36,17 @@ log = logging.getLogger("robot_mcp_bridge")
 # original tool function via functools.wraps so FastMCP's introspection
 # still picks up the docstring and type hints.
 import functools as _functools
+import time as _time
+
+# Dedupe state for MCP speak. Hermes reaches the speaker through two
+# independent paths simultaneously:
+#   (1) platform.send(text) -> _call_speak_via_mcp -> speak()
+#   (2) LLM tool call -> speak()
+# Both fire for the same reply, producing the robot saying its line
+# twice with a few seconds between repeats. Drop duplicate text within
+# a short window. Keyed on the exact string Hermes passed.
+_LAST_SPOKEN: dict[str, float] = {}
+_DEDUPE_WINDOW_S = 30.0
 
 
 def _logged_tool(fn):
@@ -46,6 +57,20 @@ def _logged_tool(fn):
         if fn.__name__ in ("speak", "speak_sync"):
             text = kwargs.get("text", "")
             lang = kwargs.get("language", "")
+            # Dedupe: if same text was spoken within the window, drop it.
+            now = _time.monotonic()
+            last = _LAST_SPOKEN.get(text, 0.0)
+            if text and (now - last) < _DEDUPE_WINDOW_S:
+                chat_log().write("BOT", text, lang=lang,
+                                  tool=fn.__name__, status="dedup")
+                return {"ok": True, "text": text, "language": lang,
+                        "deduplicated": True}
+            _LAST_SPOKEN[text] = now
+            # Trim old entries opportunistically.
+            if len(_LAST_SPOKEN) > 64:
+                cutoff = now - _DEDUPE_WINDOW_S
+                for k in [k for k, v in _LAST_SPOKEN.items() if v < cutoff]:
+                    _LAST_SPOKEN.pop(k, None)
             chat_log().write("BOT", text, lang=lang,
                               tool=fn.__name__)
             return fn(**kwargs)
