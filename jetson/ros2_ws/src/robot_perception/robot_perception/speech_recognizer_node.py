@@ -163,6 +163,10 @@ class SpeechRecognizer(Node):
             self._capturing = False
             pcm = bytes(self._buf)
             self._buf = bytearray()
+        audio_s = len(pcm) / (2.0 * self.sr) if pcm else 0.0
+        self.get_logger().info(
+            f'finalize: buf={len(pcm)} bytes ({audio_s:.2f}s), '
+            f'model={"loaded" if self._model else "None"}')
         if pcm and self._model is not None:
             threading.Thread(target=self._final_transcribe,
                              args=(pcm,), daemon=True).start()
