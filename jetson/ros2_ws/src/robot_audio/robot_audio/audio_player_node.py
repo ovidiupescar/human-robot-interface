@@ -31,7 +31,13 @@ except ImportError:
 
 class AudioPlayer(Node):
 
-    RING_SECONDS = 4.0  # max buffer depth
+    # Ring depth must exceed the longest single TTS utterance. With a
+    # 4s ring, anything Hermes streams that's longer than 4s (e.g. a
+    # multi-sentence reply at ~140 wpm = ~70 chars/s ≈ 12s for the
+    # typical long answer) overwrites itself and the user hears only
+    # the tail. 60s covers any realistic reply, costs ~2.5 MB of int16
+    # @ 22050 Hz.
+    RING_SECONDS = 60.0
 
     def __init__(self):
         super().__init__('audio_player')
@@ -44,8 +50,12 @@ class AudioPlayer(Node):
         self.sr = int(self.get_parameter('sample_rate').value)
         self.device = self.get_parameter('device').value or 'default'
 
+        # Queue depth covers a full-length reply at ~50 ms / chunk:
+        # 60 s * 1000 / 50 = 1200 messages. Without this, ROS2 drops
+        # stream chunks on overflow before the ring buffer ever sees
+        # them, and the tail-only-audio bug recurs.
         self.create_subscription(UInt8MultiArray, '/audio/stream',
-                                 self._on_stream_chunk, 100)
+                                 self._on_stream_chunk, 1500)
         self.create_subscription(UInt8MultiArray, '/audio/playback',
                                  self._on_full_clip, 10)
         self.create_subscription(Interrupt, '/control/interrupt',

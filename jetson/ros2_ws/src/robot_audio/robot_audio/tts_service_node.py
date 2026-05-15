@@ -86,8 +86,13 @@ class TtsService(Node):
             output_sample_rate=self.sr)
 
         # Publishers
+        # Publisher queue must fit the longest reply at ~50 ms / chunk:
+        # 60 s * 1000 / 50 = 1200 messages. Otherwise the engine
+        # produces chunks faster than audio_player drains them and
+        # the early ones get dropped at the publish side — user hears
+        # only the tail of long replies.
         self._stream_pub = self.create_publisher(UInt8MultiArray,
-                                                  '/audio/stream', 10)
+                                                  '/audio/stream', 1500)
         self._status_pub = self.create_publisher(String,
                                                   '/audio/playback_status', 10)
         self._face_pub = self.create_publisher(FaceCommand, '/face/command', 10)
