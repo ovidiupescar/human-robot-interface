@@ -146,8 +146,9 @@ class SpeechRecognizer(Node):
                     f'whisper load failed on device={device}: {e}. '
                     'Falling back to CPU int8.')
                 try:
+                    # CUDA-built ctranslate2 only ships float32 for CPU.
                     self._model = WhisperModel(
-                        model_size, device='cpu', compute_type='int8')
+                        model_size, device='cpu', compute_type='float32')
                     self.get_logger().info(
                         f'whisper loaded (CPU fallback): model={model_size}')
                 except Exception as e2:
