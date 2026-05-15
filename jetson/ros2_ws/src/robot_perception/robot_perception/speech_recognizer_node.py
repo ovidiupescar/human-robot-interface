@@ -16,6 +16,7 @@ The partial path uses greedy decoding (beam_size=1) for speed; the final pass
 uses beam_size=3 for quality. Both publish typed Transcript messages.
 """
 
+import re
 import threading
 import time
 
@@ -23,6 +24,38 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Bool, String, UInt8MultiArray
+
+
+# Hallucination filter — lifted from Hermes Agent's voice_mode.py.
+# Whisper produces these strings deterministically from silence,
+# breathing, or low-SNR audio. Keeping the set normalized lowercase
+# without trailing punctuation; we strip both before lookup.
+_WHISPER_HALLUCINATIONS = {
+    "thank you", "thanks for watching", "subscribe to my channel",
+    "like and subscribe", "please subscribe", "thank you for watching",
+    "bye", "you", "the end",
+    # Non-English hallucinations seen on long silence
+    "продолжение следует", "sous-titres",
+    "sous-titres réalisés par la communauté d'amara.org",
+    "sottotitoli creati dalla comunità amara.org",
+    "untertitel von stephanie geiges", "amara.org",
+    "www.mooji.org", "ご視聴ありがとうございました",
+}
+_HALLUCINATION_REPEAT_RE = re.compile(
+    r'^(?:thank you|thanks|bye|you|ok|okay|the end|\.|\s|,|!)+$',
+    flags=re.IGNORECASE,
+)
+
+
+def _is_whisper_hallucination(text: str) -> bool:
+    cleaned = text.strip().lower().rstrip('.!?')
+    if not cleaned:
+        return True
+    if cleaned in _WHISPER_HALLUCINATIONS:
+        return True
+    if _HALLUCINATION_REPEAT_RE.match(cleaned):
+        return True
+    return False
 
 from robot_perception_msgs.msg import Transcript
 
@@ -275,11 +308,12 @@ class SpeechRecognizer(Node):
     def _is_fragment(self, text: str, audio_s: float) -> bool:
         """Should this finalized transcript be dropped as noise?
 
-        Reasons covered (lifted from Pipecat's 'Filter Incomplete User Turns'):
-          - utterance audio shorter than min_final_audio_s
-          - word count below min_final_words
-          - text matches a known whisper-on-silence hallucination
-            ('thanks for watching', 'bye', 'oh', …)
+        Combines:
+          - audio length floor (min_final_audio_s)
+          - word count floor (min_final_words)
+          - project-local blacklist (params)
+          - Hermes voice_mode hallucination filter (curated phrase set
+            + repetitive-pattern regex; see _is_whisper_hallucination)
         """
         normalized = text.strip().lower().rstrip('.!?,;: ')
         if not normalized:
@@ -287,6 +321,8 @@ class SpeechRecognizer(Node):
         if audio_s < self.min_final_audio_s:
             return True
         if normalized in self.fragment_blacklist:
+            return True
+        if _is_whisper_hallucination(text):
             return True
         words = [w for w in normalized.split() if w]
         if len(words) < self.min_final_words:
