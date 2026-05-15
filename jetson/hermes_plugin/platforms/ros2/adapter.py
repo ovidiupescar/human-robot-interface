@@ -263,6 +263,14 @@ class Ros2Adapter(BasePlatformAdapter):
                      ev.get("schema_version"))
             return
         if typ == "voice":
+            raw_text = (ev.get("text") or "").strip()
+            # Slash commands (e.g. /sethome, /reset) MUST reach Hermes's
+            # command dispatcher unwrapped — otherwise they read as natural
+            # language and the agent treats them as a tool-calling prompt.
+            # Hermes routes commands by detecting a leading '/' at position 0.
+            if raw_text.startswith("/"):
+                self._dispatch(raw_text, augmentations=None)
+                return
             text, aug = _format_voice(ev)
             self._dispatch(text, augmentations=aug)
             return
