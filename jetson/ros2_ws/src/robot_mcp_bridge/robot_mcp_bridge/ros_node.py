@@ -183,6 +183,16 @@ class _BridgeNode(Node):
     # still lands inside the window even after STT queue drains.
     WAKE_WINDOW_S = 25.0
 
+    # Acoustic-wake "swallow" window. The very first short transcript
+    # arriving in the N seconds after the acoustic wake fires is almost
+    # always the wake utterance itself ("hey jarvis"), often mistranscribed
+    # by whisper ("Hey John", "Hey Jodavis", "Jarvis"). Dispatching it
+    # makes Hermes start responding to the wake greeting, and the user's
+    # real question arrives mid-reply and triggers an interrupt. Swallow
+    # the first short transcript within this window.
+    ACOUSTIC_WAKE_SWALLOW_S = 2.5
+    ACOUSTIC_WAKE_SWALLOW_MAX_WORDS = 4
+
     # Text wake fallback. STT sometimes catches "hey jarvis / hey robot"
     # at the start of an utterance when the acoustic wake_word_node misses
     # (accent, distance, model confidence < threshold). When that happens
@@ -213,6 +223,10 @@ class _BridgeNode(Node):
 
         # Wake-word window — set by /perception/wake_word, cleared by timeout.
         self._wake_until: float = 0.0
+        # Acoustic-wake swallow window: deadline before which the next
+        # short transcript is treated as the wake utterance itself
+        # (whisper transcription of "hey jarvis") and dropped.
+        self._acoustic_wake_until: float = 0.0
         # Bot-speaking suppression — set by /audio/playback_status callbacks.
         self._bot_speaking: bool = False
         self._bot_speaking_until: float = 0.0
@@ -353,6 +367,23 @@ class _BridgeNode(Node):
                                   status="wake_only")
                 return
 
+        # Acoustic-wake swallow: the first short transcript landing in
+        # the few seconds after an acoustic wake is overwhelmingly the
+        # wake utterance itself, mistranscribed by whisper as anything
+        # from "Hey John" to "Jodavis" to "Hey." Drop it so Hermes
+        # doesn't try to reply to the greeting before the real question
+        # arrives. We clear the deadline regardless so only the first
+        # transcript gets swallowed.
+        now_mono = time.monotonic()
+        if now_mono < self._acoustic_wake_until:
+            self._acoustic_wake_until = 0.0
+            word_count = len([w for w in text.split() if w])
+            if word_count <= self.ACOUSTIC_WAKE_SWALLOW_MAX_WORDS:
+                chat_log().write("USER", text,
+                                  lang=lang or self._current_language,
+                                  status="swallowed:post_wake")
+                return
+
         # Hard gate: only forward voice events to the platform adapter
         # while a wake word is recent. Without this the robot replies to
         # ambient noise (including its own TTS bleed) every utterance.
@@ -426,6 +457,12 @@ class _BridgeNode(Node):
         now = time.monotonic()
         was_open = now < self._wake_until
         self._wake_until = now + self.WAKE_WINDOW_S
+        # Remember the moment this window opened so _emit_voice can
+        # recognize "the first transcript right after wake is probably
+        # just the wake utterance itself, mis-transcribed by whisper"
+        # and refuse to dispatch it as a chat message.
+        if source == "acoustic" and not was_open:
+            self._acoustic_wake_until = now + self.ACOUSTIC_WAKE_SWALLOW_S
         self._bus.publish({
             "type": "wake_word",
             "ts": _iso_now(),
