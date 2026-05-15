@@ -46,7 +46,7 @@ class SpeechRecognizer(Node):
         # crash. 'medium' int8 gives noticeably better Romanian accuracy
         # than 'small' at roughly real-time on Orin CPU. Override via
         # launch params if running on a host with GPU-enabled ctranslate2.
-        self.declare_parameter('model_size', 'medium')
+        self.declare_parameter('model_size', 'small')
         self.declare_parameter('device', 'cpu')
         self.declare_parameter('compute_type', 'int8')
         self.declare_parameter('allowed_languages', ['ro', 'en'])

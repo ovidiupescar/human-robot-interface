@@ -177,7 +177,11 @@ class _BridgeNode(Node):
     # WAKE_WINDOW_S seconds. Without this gate, every ambient utterance
     # the VAD picks up — including the robot's own TTS reverb — becomes a
     # Hermes user message, which spirals into a self-reply loop.
-    WAKE_WINDOW_S = 12.0
+    # NOTE: whisper transcribe latency on Jetson Orin Nano CPU is 4-6s
+    # for the 'small' model, and the user can take 1-2s to start speaking
+    # after the wake-ack beep. Keep this generous so the final transcript
+    # still lands inside the window even after STT queue drains.
+    WAKE_WINDOW_S = 25.0
 
     # Text wake fallback. STT sometimes catches "hey jarvis / hey robot"
     # at the start of an utterance when the acoustic wake_word_node misses
