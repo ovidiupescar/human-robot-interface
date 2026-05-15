@@ -25,8 +25,8 @@ def generate_launch_description():
         DeclareLaunchArgument('audio_output_device', default_value=''),
         DeclareLaunchArgument('grouped_perception', default_value='true',
             description='Run perception nodes in single process executor'),
-        DeclareLaunchArgument('default_language', default_value='ro',
-            description='Default spoken language (ro|en)'),
+        DeclareLaunchArgument('default_language', default_value='en',
+            description='Default spoken language (en for now; ro deferred)'),
 
         # --- actuation / face ---
         Node(package='robot_face_bridge', executable='face_bridge', name='face_bridge',
@@ -49,7 +49,7 @@ def generate_launch_description():
         Node(package='robot_perception', executable='perception_executor',
              name='perception_executor', output='screen',
              parameters=[{'default_language': default_lang,
-                          'allowed_languages': ['ro', 'en']}],
+                          'allowed_languages': ['en']}],
              condition=IfCondition(grouped)),
 
         # --- perception (separate processes: easier debugging) ---
@@ -58,8 +58,9 @@ def generate_launch_description():
              condition=UnlessCondition(grouped)),
         Node(package='robot_perception', executable='speech_recognizer',
              name='speech_recognizer',
-             parameters=[{'model_size': 'small', 'device': 'cuda',
-                          'allowed_languages': ['ro', 'en'],
+             parameters=[{'model_size': 'small.en', 'device': 'cuda',
+                          'compute_type': 'int8_float16',
+                          'allowed_languages': ['en'],
                           'default_language': default_lang}],
              output='screen', condition=UnlessCondition(grouped)),
         Node(package='robot_perception', executable='wake_word',
@@ -71,7 +72,7 @@ def generate_launch_description():
         Node(package='robot_perception', executable='language_resolver',
              name='language_resolver',
              parameters=[{'default_language': default_lang,
-                          'allowed_languages': ['ro', 'en']}],
+                          'allowed_languages': ['en']}],
              output='screen', condition=UnlessCondition(grouped)),
         Node(package='robot_perception', executable='vision_capture',
              name='vision_capture', output='screen',
