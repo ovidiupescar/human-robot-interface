@@ -12,6 +12,12 @@ WS="$SCRIPT_DIR/../ros2_ws"
 source /opt/ros/humble/setup.bash
 source "$WS/install/setup.bash"
 
+# CUDA + CUDA-built ctranslate2 (installed to ~/.local via SETUP.md
+# steps from NVIDIA's reachy-mini-jetson-assistant). faster-whisper
+# loads ctranslate2's _ext.*.so, which needs libctranslate2.so visible.
+export LD_LIBRARY_PATH="$HOME/.local/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
+export PATH="/usr/local/cuda/bin:$PATH"
+
 # Adjust serial port + audio devices as needed. Empty overrides cannot be
 # passed via the CLI (ROS2 rejects `name:=` with no value); rely on the
 # launch file's defaults, set ENV vars to override if needed.

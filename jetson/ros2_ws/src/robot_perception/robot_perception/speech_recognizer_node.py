@@ -41,14 +41,14 @@ class SpeechRecognizer(Node):
 
     def __init__(self):
         super().__init__('speech_recognizer')
-        # Defaults tuned for Jetson Orin Nano: PyPI ctranslate2 wheels are
-        # CPU-only on ARM64 Tegra, so device='cpu' avoids a CUDA-missing
-        # crash. 'medium' int8 gives noticeably better Romanian accuracy
-        # than 'small' at roughly real-time on Orin CPU. Override via
-        # launch params if running on a host with GPU-enabled ctranslate2.
+        # Defaults tuned for Jetson Orin Nano with CUDA-built ctranslate2
+        # (see ops note: PyPI wheel is CPU-only on ARM64 Tegra and gives
+        # ~20s per 1s of audio with the 'medium' model; the from-source
+        # CUDA build drops that to under 1s). 'small' with int8_float16
+        # is the sweet spot of accuracy vs latency on Orin.
         self.declare_parameter('model_size', 'small')
-        self.declare_parameter('device', 'cpu')
-        self.declare_parameter('compute_type', 'int8')
+        self.declare_parameter('device', 'cuda')
+        self.declare_parameter('compute_type', 'int8_float16')
         self.declare_parameter('allowed_languages', ['ro', 'en'])
         self.declare_parameter('default_language', 'ro')
         self.declare_parameter('sample_rate', 16000)
@@ -129,16 +129,27 @@ class SpeechRecognizer(Node):
 
         self._model = None
         if WhisperModel is not None:
+            model_size = self.get_parameter('model_size').value
+            device = self.get_parameter('device').value
+            compute_type = self.get_parameter('compute_type').value
             try:
                 self._model = WhisperModel(
-                    self.get_parameter('model_size').value,
-                    device=self.get_parameter('device').value,
-                    compute_type=self.get_parameter('compute_type').value,
-                )
+                    model_size, device=device, compute_type=compute_type)
                 self.get_logger().info(
-                    f'whisper loaded; allowed_languages={self.allowed}')
+                    f'whisper loaded: model={model_size} device={device} '
+                    f'compute={compute_type} allowed={self.allowed}')
             except Exception as e:
-                self.get_logger().error(f'whisper load failed: {e}')
+                self.get_logger().warning(
+                    f'whisper load failed on device={device}: {e}. '
+                    'Falling back to CPU int8.')
+                try:
+                    self._model = WhisperModel(
+                        model_size, device='cpu', compute_type='int8')
+                    self.get_logger().info(
+                        f'whisper loaded (CPU fallback): model={model_size}')
+                except Exception as e2:
+                    self.get_logger().error(
+                        f'whisper load failed on CPU too: {e2}')
         else:
             self.get_logger().warning('faster-whisper not installed; STT disabled')
 
