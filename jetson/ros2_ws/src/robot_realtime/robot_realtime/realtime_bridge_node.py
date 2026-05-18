@@ -218,10 +218,27 @@ class RealtimeBridge(Node):
             self._session = session
             self._ready.set()
             self.get_logger().info("Gemini Live session established")
+            # asyncio.TaskGroup needs Python 3.11; ROS2 Humble is 3.10.
+            # Use asyncio.wait(FIRST_EXCEPTION) to get equivalent
+            # structured-concurrency semantics: if either coroutine
+            # raises, cancel the other and surface the error.
+            send_task = asyncio.create_task(self._send_realtime())
+            recv_task = asyncio.create_task(self._receive_loop())
             try:
-                async with asyncio.TaskGroup() as tg:
-                    tg.create_task(self._send_realtime())
-                    tg.create_task(self._receive_loop())
+                done, pending = await asyncio.wait(
+                    [send_task, recv_task],
+                    return_when=asyncio.FIRST_EXCEPTION)
+                for t in pending:
+                    t.cancel()
+                # Drain cancellations so they don't show as un-retrieved
+                # exceptions during shutdown.
+                for t in pending:
+                    try:
+                        await t
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                for t in done:
+                    t.result()  # propagate first exception, if any
             finally:
                 # On exit, signal end of TTS so audio_capture unmutes.
                 if self._bot_speaking:
