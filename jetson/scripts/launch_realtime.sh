@@ -14,6 +14,12 @@ source "$WS/install/setup.bash"
 export LD_LIBRARY_PATH="$HOME/.local/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
 export PATH="/usr/local/cuda/bin:$PATH"
 
+# CRITICAL: must match robot-stack's RMW implementation so the bridge
+# sees /audio/chunk and /perception/wake_word. Default fastrtps will
+# look isolated from a cyclonedds-running stack — DDS implementations
+# do not interoperate at the wire level.
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+
 # GEMINI_API_KEY can be set via:
 #   1. ~/.hermes/.env (preferred; one place for all keys)
 #   2. environment passed in by systemd unit
