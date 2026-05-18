@@ -137,6 +137,12 @@ class RealtimeBridge(Node):
         self._wake_active_until = 0.0
         self._bot_speaking = False
         self._tail_until = 0.0
+        # Total int16 bytes published to /audio/stream during the
+        # current turn. Used to defer the playback_status='done' until
+        # audio_player has actually finished draining its ring buffer
+        # (otherwise the speaker bleeds bot voice back into the mic
+        # and Gemini sees continuous user speech, never turn-completing).
+        self._turn_audio_bytes = 0
         self._session: Optional[Any] = None
         self._ready = threading.Event()
 
@@ -320,16 +326,41 @@ class RealtimeBridge(Node):
         if produced_bytes and not self._bot_speaking:
             self._emit_playback_status("started")
             self._bot_speaking = True
-        if turn_complete:
-            if self._bot_speaking:
-                self._emit_playback_status("done")
-                self._bot_speaking = False
-                self._tail_until = time.monotonic() + 0.6
-        if interrupted:
-            if self._bot_speaking:
-                self._emit_playback_status("interrupted")
-                self._bot_speaking = False
-                self._tail_until = time.monotonic() + 0.6
+        if turn_complete and self._bot_speaking:
+            # Defer 'done' until audio_player has had time to drain its
+            # ring buffer of all the chunks we published this turn —
+            # otherwise the speaker is still playing the reply when
+            # audio_capture unmutes the mic, the bot voice bleeds in,
+            # gets forwarded to Gemini as user speech, and the model
+            # never gets to turn-complete again on a fresh user query.
+            asyncio.create_task(self._delayed_emit_done())
+        if interrupted and self._bot_speaking:
+            self._emit_playback_status("interrupted")
+            self._bot_speaking = False
+            self._tail_until = time.monotonic() + 0.6
+            self._turn_audio_bytes = 0
+
+    async def _delayed_emit_done(self) -> None:
+        # Estimate playback duration from bytes published this turn.
+        # int16 mono @ PLAYBACK_PUBLISH_RATE => 2 bytes/sample.
+        sample_bytes = max(self._turn_audio_bytes, 0)
+        playback_s = sample_bytes / (PLAYBACK_PUBLISH_RATE * 2.0)
+        # Reset counter NOW so the next turn's count starts clean even
+        # if we're still sleeping when its first audio chunk lands.
+        self._turn_audio_bytes = 0
+        # Small extra margin for audio_player's output latency + the
+        # speaker tail (room echo).
+        wait_s = max(playback_s, 0.0) + 0.5
+        self.get_logger().info(
+            f"deferring done by {wait_s:.2f}s "
+            f"(playback_s={playback_s:.2f})")
+        try:
+            await asyncio.sleep(wait_s)
+        except asyncio.CancelledError:
+            pass
+        self._emit_playback_status("done")
+        self._bot_speaking = False
+        self._tail_until = time.monotonic() + 0.6
 
     async def _handle_tool_call(self, tool_call: Any) -> None:
         function_calls = getattr(tool_call, "function_calls", []) or []
@@ -414,8 +445,11 @@ class RealtimeBridge(Node):
         resampled = np.interp(
             x_new, xp, samples.astype(np.float32)).astype(np.int16)
         msg = UInt8MultiArray()
-        msg.data = array("B", resampled.tobytes())
+        pcm_out_bytes = resampled.tobytes()
+        msg.data = array("B", pcm_out_bytes)
         self._stream_pub.publish(msg)
+        # Track playback length for the deferred 'done' below.
+        self._turn_audio_bytes += len(pcm_out_bytes)
         rms = float(np.sqrt(np.mean(resampled.astype(np.float32) ** 2)))
         amp = min(1.0, max(MOUTH_MIN_AMP, rms / 8000.0))
         face = FaceCommand()
