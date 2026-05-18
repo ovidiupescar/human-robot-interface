@@ -160,7 +160,11 @@ class RealtimeBridge(Node):
     # ---- ROS callbacks (rclpy executor thread) ----
 
     def _on_wake(self, _msg: String) -> None:
+        was_open = time.monotonic() < self._wake_active_until
         self._wake_active_until = time.monotonic() + self.wake_window_s
+        if not was_open:
+            self.get_logger().info(
+                f"wake window opened (window_s={self.wake_window_s})")
 
     def _on_playback_status(self, msg: String) -> None:
         if msg.data == "started":
@@ -249,12 +253,19 @@ class RealtimeBridge(Node):
         """Drain mic queue → send to Gemini Live."""
         assert self._mic_queue is not None
         assert self._session is not None
+        sent_count = 0
         while True:
             chunk = await self._mic_queue.get()
             try:
                 await self._session.send_realtime_input(
                     media={"mime_type": f"audio/pcm;rate={INPUT_SAMPLE_RATE}",
                            "data": chunk})
+                sent_count += 1
+                # Once per second of audio (50 * 20ms chunks)
+                if sent_count % 50 == 0:
+                    self.get_logger().info(
+                        f"sent {sent_count} mic chunks "
+                        f"({sent_count * 0.02:.1f}s of audio)")
             except Exception as exc:
                 self.get_logger().warning(f"send_realtime_input failed: {exc}")
                 raise  # let TaskGroup tear down → reconnect
@@ -266,6 +277,7 @@ class RealtimeBridge(Node):
             # Tool calls
             tool_call = getattr(response, "tool_call", None)
             if tool_call is not None:
+                self.get_logger().info("server: tool_call event")
                 await self._handle_tool_call(tool_call)
                 continue
             # Server content carries audio chunks and turn flags
@@ -275,10 +287,16 @@ class RealtimeBridge(Node):
                 continue
             # Some events (setup_complete, generation_complete) we just log
             if getattr(response, "setup_complete", None) is not None:
-                self.get_logger().info("setup_complete received")
+                self.get_logger().info("server: setup_complete")
+            else:
+                # Anything else - dump for diagnosis
+                attrs = [a for a in dir(response)
+                         if not a.startswith("_")
+                         and getattr(response, a, None) is not None]
+                self.get_logger().info(f"server: unknown event, attrs={attrs}")
 
     async def _handle_server_content(self, sc: Any) -> None:
-        produced = False
+        produced_bytes = 0
         model_turn = getattr(sc, "model_turn", None)
         if model_turn is not None:
             for part in getattr(model_turn, "parts", []) or []:
@@ -292,16 +310,22 @@ class RealtimeBridge(Node):
                 if not data:
                     continue
                 self._publish_audio(data)
-                produced = True
-        if produced and not self._bot_speaking:
+                produced_bytes += len(data)
+        turn_complete = bool(getattr(sc, "turn_complete", False))
+        interrupted = bool(getattr(sc, "interrupted", False))
+        if produced_bytes or turn_complete or interrupted:
+            self.get_logger().info(
+                f"server_content: audio={produced_bytes}B "
+                f"turn_complete={turn_complete} interrupted={interrupted}")
+        if produced_bytes and not self._bot_speaking:
             self._emit_playback_status("started")
             self._bot_speaking = True
-        if getattr(sc, "turn_complete", False):
+        if turn_complete:
             if self._bot_speaking:
                 self._emit_playback_status("done")
                 self._bot_speaking = False
                 self._tail_until = time.monotonic() + 0.6
-        if getattr(sc, "interrupted", False):
+        if interrupted:
             if self._bot_speaking:
                 self._emit_playback_status("interrupted")
                 self._bot_speaking = False
